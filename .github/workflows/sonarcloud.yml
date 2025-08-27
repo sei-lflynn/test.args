@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   Analysis:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read
@@ -25,6 +25,11 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+
+      - name: Set up Python (pinned)
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4.9.1
+        with:
+          python-version: "3.12"
 
       - name: Prepare reports directory and compile_commands.json
         run: |
@@ -42,13 +47,8 @@ jobs:
           output: reports/trivy.sarif
           exit-code: 0
 
-      - name: Install Semgrep CLI
-        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4.9.1
-        with:
-          python-version: '3.x'
-
-      - name: Install Semgrep
-        run: python3 -m pip install --upgrade semgrep
+      - name: Install Semgrep (pinned)
+        run: python3 -m pip install --upgrade "semgrep==1.77.0"
 
       - name: Run Semgrep scan
         run: semgrep --config p/ci --sarif --output reports/semgrep.sarif .
