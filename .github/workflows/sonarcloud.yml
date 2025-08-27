@@ -8,12 +8,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  pull-requests: read
-  security-events: write
+  contents: read
 
 jobs:
   Analysis:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
@@ -33,7 +35,7 @@ jobs:
           echo ']' >> compile_commands.json
 
       - name: Run Trivy scan
-        uses: aquasecurity/trivy-action@f9424c10c36e288d5fa79bd3dfd1aeb2d6eae808 # master
+        uses: aquasecurity/trivy-action@f9424c10c36e288d5fa79bd3dfd1aeb2d6eae808
         with:
           scan-type: fs
           format: sarif
@@ -61,4 +63,3 @@ jobs:
             -Dsonar.login=${{ env.SONAR_TOKEN }}
             -Dsonar.sarifReportPaths=reports/trivy.sarif,reports/semgrep.sarif
             -Dsonar.cfamily.compile-commands=compile_commands.json
-
