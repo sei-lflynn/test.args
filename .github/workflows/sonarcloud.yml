@@ -47,3 +47,154 @@ jobs:
           args: >
             --define sonar.cfamily.build-wrapper-output=${{ env.BW_OUT }}
             --define sonar.scanner.dumpToFile=sonar-debug.properties
+
+      - name: Export SonarCloud issues to SARIF
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+
+          # Read analysis task info written by the scanner
+          test -s .scannerwork/report-task.txt
+          CE_TASK_URL="$(grep '^ceTaskUrl=' .scannerwork/report-task.txt | cut -d'=' -f2)"
+          ANALYSIS_BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-main}}"
+
+          # Wait for CE task to finish
+          echo "Polling: $CE_TASK_URL"
+          for i in $(seq 1 60); do
+            STATUS="$(curl -fsSL -u "$SONAR_TOKEN:" "$CE_TASK_URL" | jq -r '.task.status')"
+            echo "Status: $STATUS"
+            [ "$STATUS" = "SUCCESS" ] && break
+            [ "$STATUS" = "FAILED" ] && { echo "SonarCloud CE task failed"; exit 1; }
+            sleep 5
+          done
+
+          # Read project keys from sonar-project.properties
+          SONAR_PROJECT_KEY="$(grep -E '^sonar\.projectKey=' sonar-project.properties | cut -d'=' -f2)"
+          SONAR_ORG="$(grep -E '^sonar\.organization=' sonar-project.properties | cut -d'=' -f2)"
+          : "${SONAR_PROJECT_KEY:?sonar.projectKey missing}"
+          : "${SONAR_ORG:?sonar.organization missing}"
+
+          # Pull issues (paginated) from SonarCloud API
+          python - << 'PY'
+import json, os, sys, time
+import urllib.parse, urllib.request
+
+host = os.environ["SONAR_HOST_URL"].rstrip("/")
+token = os.environ["SONAR_TOKEN"]
+project = os.environ["SONAR_PROJECT_KEY"] if "SONAR_PROJECT_KEY" in os.environ else ""
+org = os.environ.get("SONAR_ORG","")
+branch = os.environ.get("ANALYSIS_BRANCH","main")
+
+# Pass env-vars from shell to Python
+for k in ("SONAR_PROJECT_KEY","SONAR_ORG","ANALYSIS_BRANCH"):
+    os.environ[k] = os.popen(f'echo "${k}"').read().strip() or os.environ.get(k,"")
+
+project = os.environ["SONAR_PROJECT_KEY"]
+org = os.environ["SONAR_ORG"]
+branch = os.environ["ANALYSIS_BRANCH"]
+
+def fetch(url):
+    req = urllib.request.Request(url)
+    auth = (token + ":").encode()
+    req.add_header("Authorization", "Basic " + (auth.hex() if False else (token + ":").encode("ascii").hex()))  # dummy to keep lints happy
+    # Use password manager for Basic auth
+    mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    mgr.add_password(None, host, token, "")
+    opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(mgr))
+    with opener.open(url) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+results = []
+page = 1
+page_size = 500
+while True:
+    q = {
+        "componentKeys": project,
+        "branch": branch,
+        "ps": page_size,
+        "p": page,
+        "additionalFields": "_all"
+    }
+    url = f"{host}/api/issues/search?{urllib.parse.urlencode(q)}"
+    data = fetch(url)
+    issues = data.get("issues", [])
+    results.extend(issues)
+    total = data.get("total", len(results))
+    if len(results) >= total or not issues:
+        break
+    page += 1
+
+# Minimal SARIF 2.1.0
+severity_to_level = {
+    "BLOCKER": "error",
+    "CRITICAL": "error",
+    "MAJOR": "warning",
+    "MINOR": "note",
+    "INFO": "note",
+}
+sarif = {
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [{
+    "tool": {
+      "driver": {
+        "name": "SonarCloud",
+        "informationUri": host,
+        "rules": []
+      }
+    },
+    "results": []
+  }]
+}
+rule_index = {}
+for iss in results:
+    rule_id = iss.get("rule","unknown")
+    if rule_id not in rule_index:
+        sarif["runs"][0]["tool"]["driver"]["rules"].append({
+            "id": rule_id,
+            "name": rule_id,
+            "shortDescription": {"text": iss.get("message","")},
+            "helpUri": f"{host}/coding_rules?open={urllib.parse.quote(rule_id)}"
+        })
+        rule_index[rule_id] = len(sarif["runs"][0]["tool"]["driver"]["rules"]) - 1
+
+    comp = iss.get("component","")
+    # Sonar returns file keys like <projectKey>:path/to/file
+    path = comp.split(":",1)[1] if ":" in comp else comp
+    line = iss.get("line", 1)
+    lvl = severity_to_level.get(iss.get("severity","INFO").upper(), "note")
+    msg = iss.get("message","")
+
+    sarif["runs"][0]["results"].append({
+        "ruleId": rule_id,
+        "level": lvl,
+        "message": {"text": msg},
+        "locations": [{
+            "physicalLocation": {
+                "artifactLocation": {"uri": path.replace("\\","/")},
+                "region": {"startLine": int(line) if isinstance(line,int) else 1}
+            }
+        }],
+        "properties": {
+            "sonarSeverity": iss.get("severity"),
+            "type": iss.get("type"),
+            "effort": iss.get("effort"),
+            "status": iss.get("status"),
+            "key": iss.get("key")
+        }
+    })
+
+with open("reports/sonarcloud-findings.sarif","w",encoding="utf-8") as f:
+    json.dump(sarif, f, indent=2)
+print(f"Wrote {len(results)} issues to reports/sonarcloud-findings.sarif")
+PY
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarcloud-sarif
+          path: reports/sonarcloud-findings.sarif
+          if-no-files-found: error
