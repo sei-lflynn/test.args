@@ -30,8 +30,14 @@ jobs:
       - name: Build (wrapped)
         run: |
           mkdir -p build
-          build-wrapper-linux-x86-64 --out-dir "${BUILD_WRAPPER_OUT_DIR}" \
+          build-wrapper-linux-x86-64 --out-dir ${BUILD_WRAPPER_OUT_DIR} \
             gcc -std=c17 -I. -O2 -g -c main.c -o build/main.o
+
+      - name: Verify compile_commands.json exists
+        run: |
+          ls -l ${BUILD_WRAPPER_OUT_DIR}
+          test -s ${BUILD_WRAPPER_OUT_DIR}/compile_commands.json
+          head -n 20 ${BUILD_WRAPPER_OUT_DIR}/compile_commands.json || true
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v5
@@ -40,4 +46,4 @@ jobs:
           SONAR_HOST_URL: https://sonarcloud.io
         with:
           args: >
-            --define sonar.cfamily.compile-commands="${{ env.BUILD_WRAPPER_OUT_DIR }}/compile_commands.json"
+            --define sonar.cfamily.compile-commands=${{ env.BUILD_WRAPPER_OUT_DIR }}/compile_commands.json
