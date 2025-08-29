@@ -1,101 +1,43 @@
-name: SonarCloud analysis
+name: SonarCloud
 
 on:
   push:
+    branches: [main]
   pull_request:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  pull-requests: read
+    types: [opened, synchronize, reopened]
 
 jobs:
-  Analysis:
-    runs-on: ubuntu-24.04
+  build:
+    name: Build and analyze
+    runs-on: ubuntu-latest
+    env:
+      BUILD_WRAPPER_OUT_DIR: bw-out
+
     steps:
-      - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          egress-policy: audit
+          fetch-depth: 0
 
-      - name: Checkout repository
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - name: Ensure main.c exists
+        run: test -f main.c
 
-      - name: Set up Python (pinned)
-        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4.9.1
-        with:
-          python-version: "3.12"
+      - name: Install Build Wrapper
+        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v5
+        env:
+          SONAR_HOST_URL: https://sonarcloud.io
 
-      - name: Build C object(s)
+      - name: Build (wrapped)
         run: |
-          set -eux
-          test -f main.c
           mkdir -p build
-          gcc -std=c17 -I. -O2 -g -c main.c -o build/main.o
-
-      # Use existing compile_commands.json if present; otherwise create one.
-      - name: Create or reuse compile_commands.json
-        run: |
-          set -eux
-          if [ ! -f compile_commands.json ]; then
-            python - <<'PY'
-import json
-cc = [{
-  "directory": "/github/workspace",
-  "command": "gcc -std=c17 -I. -O2 -g -c main.c -o build/main.o",
-  "file": "main.c"
-}]
-with open("compile_commands.json","w") as f: json.dump(cc, f, indent=2)
-PY
-          fi
-
-      # Normalize host paths (/home/runner/work/...) to the scanner's mount (/github/workspace)
-      - name: Normalize compile_commands paths for Sonar container
-        run: |
-          python - <<'PY'
-import json, os, pathlib
-host_root = os.environ["GITHUB_WORKSPACE"]           # e.g., /home/runner/work/owner/repo
-container_root = "/github/workspace"
-with open("compile_commands.json") as f:
-    cc = json.load(f)
-for e in cc:
-    d = e.get("directory",".")
-    # if entry starts with host workspace, map to container path + relative suffix
-    try:
-        p = pathlib.Path(d)
-        if str(p).startswith(host_root):
-            rel = os.path.relpath(str(p), host_root)
-            e["directory"] = os.path.join(container_root, rel) if rel != "." else container_root
-        else:
-            # If it's an absolute path elsewhere, force to repo root in container
-            if os.path.isabs(d):
-                e["directory"] = container_root
-    except Exception:
-        e["directory"] = container_root
-    # Ensure command is a compilation, not link
-    cmd = e.get("command","")
-    if " -c " not in f" {cmd} ":
-        # Replace any '-o main' style link with a compile of the file to build dir
-        src = e.get("file","")
-        if src:
-            e["command"] = f"gcc -std=c17 -I. -O2 -g -c {src} -o build/{os.path.splitext(os.path.basename(src))[0]}.o"
-        else:
-            e["command"] = "gcc -std=c17 -I. -O2 -g -c main.c -o build/main.o"
-with open("compile_commands.json","w") as f:
-    json.dump(cc, f, indent=2)
-# Final sanity: show entries
-print(open("compile_commands.json").read())
-PY
-
-      - name: Prepare reports dir (optional SARIF imports)
-        run: mkdir -p reports
+          build-wrapper-linux-x86-64 --out-dir "${BUILD_WRAPPER_OUT_DIR}" \
+            gcc -std=c17 -I. -O2 -g -c main.c -o build/main.o
 
       - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-github-action@4006f663ecaf1f8093e8e4abb9227f6041f52216
+        uses: SonarSource/sonarqube-scan-action@v5
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}   # picked up as sonar.token
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
         with:
-          projectBaseDir: .
           args: >
-            -Dsonar.sarifReportPaths=reports/trivy.sarif,reports/semgrep.sarif
-            -Dsonar.cfamily.compile-commands=compile_commands.json
+            --define sonar.cfamily.compile-commands="${{ env.BUILD_WRAPPER_OUT_DIR }}/compile_commands.json"
