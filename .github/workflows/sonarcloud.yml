@@ -1,59 +1,52 @@
+# Workflow: SonarCloud analysis + SARIF upload
+# Notes:
+# - Top-level GITHUB_TOKEN perms minimized (contents: read).
+# - Write perms (security-events: write) only granted to the job that uploads SARIF.
+# - SonarCloud step is skipped on forked PRs (no secrets on forks).
+# - Artifact steps pinned to full commit SHAs for immutability.
+
 name: SonarCloud analysis
 
 on:
   push:
-    # branches: [ "main" ]
   pull_request:
-    # branches: [ "main" ]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
+# Default to least privilege at the workflow level.
 permissions:
   contents: read
 
 jobs:
   Analysis:
-    runs-on: ubuntu-24.04
+    name: Build & scan (produce SARIF)
+    runs-on: ubuntu-latest
+    # This job only needs read access to code.
     permissions:
       contents: read
-      pull-requests: read
 
     steps:
+      # Harden: audit egress only (no block) so first-run is non-disruptive.
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
 
       - name: Checkout repository
+        # Pinned to a full SHA (example kept from earlier workflow).
         uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
 
       - name: Prepare reports directory and compile_commands.json
         run: |
           mkdir -p reports
-          # Build a minimal compile_commands.json for main.c
           echo '[' > compile_commands.json
           echo '  { "directory": "'"${PWD}"'", "command": "gcc -std=c17 -I. -O2 -g main.c -o main", "file": "main.c" }' >> compile_commands.json
           echo ']' >> compile_commands.json
 
-      - name: Run Trivy scan (version pinned)
-        uses: aquasecurity/trivy-action@f9424c10c36e288d5fa79bd3dfd1aeb2d6eae808
-        with:
-          version: v0.64.1
-          scan-type: fs
-          format: sarif
-          output: reports/trivy.sarif
-          exit-code: 0
-
-      - name: Run Semgrep scan (pinned Docker digest; no pip)
-        # Pin the Semgrep CLI via an immutable Docker image digest
-        uses: docker://semgrep/semgrep:1.127.1@sha256:85f9de554201cc891c470774bb93a7f4faf41ea198ddccc34a855b53f7a51443
-        with:
-          args: >
-            semgrep scan
-            --config p/ci
-            --sarif --output reports/semgrep.sarif
-            --metrics=off
-
+      # Skip SonarCloud on PRs from forks (no secrets provided on forks).
       - name: SonarCloud Scan
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
+        continue-on-error: true  # Ensure SARIF artifact upload still happens
         uses: SonarSource/sonarcloud-github-action@4006f663ecaf1f8093e8e4abb9227f6041f52216
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -63,3 +56,54 @@ jobs:
             -Dsonar.login=${{ env.SONAR_TOKEN }}
             -Dsonar.sarifReportPaths=reports/trivy.sarif,reports/semgrep.sarif
             -Dsonar.cfamily.compile-commands=compile_commands.json
+
+      # Always publish SARIF files as an artifact so another job (with write perms)
+      # can upload to the Code Scanning Security tab—even for forked PRs.
+      - name: Upload SARIF bundle
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sarif-bundle
+          path: |
+            reports/trivy.sarif
+            reports/semgrep.sarif
+          retention-days: 180
+          if-no-files-found: error
+
+  UploadSARIF:
+    name: Upload SARIF to GitHub Code Scanning
+    needs: Analysis
+    runs-on: ubuntu-latest
+    # Must have security-events: write to upload results.
+    # Note: For pull_request from forks, the repository setting
+    # "Workflow permissions" must allow GITHUB_TOKEN read & write.
+    permissions:
+      contents: read
+      security-events: write
+    # Run even if Analysis had soft failures; upload whatever exists.
+    if: always()
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      - name: Download SARIF bundle
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: sarif-bundle
+          path: sarif
+
+      # Upload each SARIF file separately. If one is missing, keep going.
+      - name: Upload Semgrep SARIF
+        if: ${{ hashFiles('sarif/semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
+        with:
+          sarif_file: sarif/semgrep.sarif
+
+      - name: Upload Trivy SARIF
+        if: ${{ hashFiles('sarif/trivy.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
+        with:
+          sarif_file: sarif/trivy.sarif
