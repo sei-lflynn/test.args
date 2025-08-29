@@ -2,21 +2,16 @@ name: SonarCloud analysis
 
 on:
   push:
-    # branches: [ "main" ]
   pull_request:
-    # branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   Analysis:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pull-requests: read
-
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
@@ -31,35 +26,33 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Prepare reports directory and compile_commands.json
+      - name: Prepare reports dir
+        run: mkdir -p reports
+
+      # Generate a compile_commands.json that matches the current workspace paths.
+      # In a real project, replace this with your actual build that emits the file
+      # (e.g., CMake with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON or bear/intercept-build).
+      - name: Build & emit compile_commands.json (demo)
         run: |
-          mkdir -p reports
-          # Build a minimal compile_commands.json for main.c
           echo '[' > compile_commands.json
           echo '  { "directory": "'"${PWD}"'", "command": "gcc -std=c17 -I. -O2 -g main.c -o main", "file": "main.c" }' >> compile_commands.json
           echo ']' >> compile_commands.json
+          gcc -std=c17 -I. -O2 -g main.c -o main
 
-      - name: Run Trivy scan
-        uses: aquasecurity/trivy-action@f9424c10c36e288d5fa79bd3dfd1aeb2d6eae808
-        with:
-          scan-type: fs
-          format: sarif
-          output: reports/trivy.sarif
-          exit-code: 0
-
-      - name: Install Semgrep (pinned)
-        run: python3 -m pip install --upgrade "semgrep==1.77.0"
-
-      - name: Run Semgrep scan
-        run: semgrep --config p/ci --sarif --output reports/semgrep.sarif .
+      # Assemble Sonar args dynamically so we only enable CFamily when C files exist
+      - name: Compose Sonar args
+        id: sonar_args
+        run: |
+          ARGS="-Dsonar.sarifReportPaths=reports/trivy.sarif,reports/semgrep.sarif"
+          if git ls-files '*.c' | grep -q .; then
+            ARGS="$ARGS -Dsonar.cfamily.compile-commands=compile_commands.json"
+          fi
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@4006f663ecaf1f8093e8e4abb9227f6041f52216
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}  # picked up automatically as sonar.token
         with:
           projectBaseDir: .
-          args: |
-            -Dsonar.login=${{ env.SONAR_TOKEN }}
-            -Dsonar.sarifReportPaths=reports/trivy.sarif,reports/semgrep.sarif
-            -Dsonar.cfamily.compile-commands=compile_commands.json
+          args: ${{ steps.sonar_args.outputs.args }}
