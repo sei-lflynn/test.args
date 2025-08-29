@@ -57,30 +57,76 @@ jobs:
           SONAR_HOST_URL: https://sonarcloud.io
         run: |
           set -euo pipefail
+          command -v jq >/dev/null
+
           mkdir -p reports
+
+          # 1) Wait for Compute Engine to finish
           test -s .scannerwork/report-task.txt
           CE_TASK_URL="$(grep '^ceTaskUrl=' .scannerwork/report-task.txt | cut -d'=' -f2)"
-          for i in $(seq 1 60); do
-            STATUS="$(curl -fsSL -u "$SONAR_TOKEN:" "$CE_TASK_URL" | jq -r '.task.status')"
-            echo "Compute Engine status: $STATUS"
-            [ "$STATUS" = "SUCCESS" ] && break
-            [ "$STATUS" = "FAILED" ] && { echo "SonarCloud CE task failed"; exit 1; }
+
+          echo "Polling CE task: ${CE_TASK_URL}"
+          for _ in $(seq 1 60); do
+            BODY="$(curl -sS -u "$SONAR_TOKEN:" "$CE_TASK_URL")"
+            STATUS="$(echo "$BODY" | jq -r '.task.status')"
+            echo "CE status: $STATUS"
+            if [ "$STATUS" = "SUCCESS" ]; then
+              break
+            elif [ "$STATUS" = "FAILED" ]; then
+              echo "$BODY" | jq .
+              echo "Compute Engine task failed"
+              exit 1
+            fi
             sleep 5
           done
+
+          # 2) Resolve project and selector (branch vs pullRequest)
           SONAR_PROJECT_KEY="$(grep -E '^sonar\.projectKey=' sonar-project.properties | cut -d'=' -f2)"
-          SONAR_ORG="$(grep -E '^sonar\.organization=' sonar-project.properties | cut -d'=' -f2)"
-          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-main}}"
-          ALL_ISSUES=$(mktemp); : > "$ALL_ISSUES"
+          : "${SONAR_PROJECT_KEY:?sonar.projectKey missing in sonar-project.properties}"
+
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            SELECTOR_KIND="pullRequest"
+            SELECTOR_VALUE="${{ github.event.pull_request.number }}"
+          else
+            SELECTOR_KIND="branch"
+            SELECTOR_VALUE="${GITHUB_REF_NAME:-main}"
+          fi
+          echo "Selector: ${SELECTOR_KIND}=${SELECTOR_VALUE}"
+
+          # 3) Page through issues safely (URL-encoded), write NDJSON
+          ALL_ISSUES="$(mktemp)"; : > "$ALL_ISSUES"
           PAGE=1; PAGE_SIZE=500
           while :; do
-            URL="${SONAR_HOST_URL%/}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&branch=${BRANCH}&ps=${PAGE_SIZE}&p=${PAGE}&additionalFields=_all"
-            JSON="$(curl -fsSL -u "$SONAR_TOKEN:" "$URL")"
-            echo "$JSON" | jq -c '.issues[]' >> "$ALL_ISSUES" || true
-            TOTAL=$(echo "$JSON" | jq -r '.total // 0')
-            COUNT=$(wc -l < "$ALL_ISSUES" | tr -d ' ')
+            # Build encoded query
+            Q=( "--data-urlencode" "componentKeys=${SONAR_PROJECT_KEY}"
+                "--data-urlencode" "ps=${PAGE_SIZE}"
+                "--data-urlencode" "p=${PAGE}"
+                "--data-urlencode" "additionalFields=_all" )
+            if [ "$SELECTOR_KIND" = "pullRequest" ]; then
+              Q+=( "--data-urlencode" "pullRequest=${SELECTOR_VALUE}" )
+            else
+              Q+=( "--data-urlencode" "branch=${SELECTOR_VALUE}" )
+            fi
+
+            # Capture response and HTTP code
+            RESP="$(mktemp)"
+            CODE="$(curl -sS -u "$SONAR_TOKEN:" -G "${SONAR_HOST_URL%/}/api/issues/search" "${Q[@]}" -w "%{http_code}" -o "$RESP")"
+            if [ "$CODE" != "200" ]; then
+              echo "SonarCloud API /api/issues/search returned HTTP $CODE"
+              cat "$RESP" && rm -f "$RESP"
+              exit 1
+            fi
+
+            jq -c '.issues[]' "$RESP" >> "$ALL_ISSUES" || true
+            TOTAL="$(jq -r '.total // 0' "$RESP")"
+            COUNT="$(wc -l < "$ALL_ISSUES" | tr -d ' ')"
+            rm -f "$RESP"
+
             [ "$COUNT" -ge "$TOTAL" ] && break
             PAGE=$((PAGE+1))
           done
+
+          # 4) Build SARIF 2.1.0 (using jq only)
           cat > reports/sonarcloud-findings.sarif <<'JSON'
           {
             "version": "2.1.0",
@@ -91,21 +137,24 @@ jobs:
             }]
           }
           JSON
+
           jq -s '
             def level(s):
               if s=="BLOCKER" or s=="CRITICAL" then "error"
               elif s=="MAJOR" then "warning"
               else "note" end;
-            def ruleId: .rule;
-            def filePath: ( .component | split(":") | if length>1 then .[1] else .[0] end );
+
+            def rid: .rule;
+            def path: ( .component | split(":") | if length>1 then .[1] else .[0] end );
+
             {
-              rules: ( [ .[] | { id: ruleId, name: ruleId } ] | unique ),
+              rules: ( [ .[] | { id: rid, name: rid } ] | unique ),
               results: [ .[] | {
-                ruleId: ruleId,
+                ruleId: rid,
                 level: level(.severity),
                 message: { text: .message },
                 locations: [ { physicalLocation: {
-                  artifactLocation: { uri: (filePath | gsub("\\\\"; "/")) },
+                  artifactLocation: { uri: (path | gsub("\\\\"; "/")) },
                   region: { startLine: (if (.line|type)=="number" then .line else 1 end) }
                 } } ],
                 properties: {
@@ -114,10 +163,12 @@ jobs:
               } ]
             }
           ' "$ALL_ISSUES" > reports/_tmp.json
+
           jq '
             .runs[0].tool.driver.rules = (input.rules | unique_by(.id)) |
             .runs[0].results = input.results
           ' reports/sonarcloud-findings.sarif reports/_tmp.json > reports/_final.sarif
+
           mv reports/_final.sarif reports/sonarcloud-findings.sarif
           rm -f reports/_tmp.json "$ALL_ISSUES"
           echo "Wrote reports/sonarcloud-findings.sarif"
