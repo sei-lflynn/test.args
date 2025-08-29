@@ -34,10 +34,26 @@ jobs:
       # (e.g., CMake with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON or bear/intercept-build).
       - name: Build & emit compile_commands.json (demo)
         run: |
-          echo '[' > compile_commands.json
-          echo '  { "directory": "'"${PWD}"'", "command": "gcc -std=c17 -I. -O2 -g main.c -o main", "file": "main.c" }' >> compile_commands.json
-          echo ']' >> compile_commands.json
-          gcc -std=c17 -I. -O2 -g main.c -o main
+          set -eux
+          gcc --version
+          # Ensure the C file exists (remove this guard if not needed)
+          test -f main.c
+          # Create a proper compilation command (produces an object file)
+          cat > compile_commands.json <<'JSON'
+          [
+            {
+              "directory": "__DIR__",
+              "command": "gcc -std=c17 -I. -O2 -g -c main.c -o main.o",
+              "file": "main.c"
+            }
+          ]
+          JSON
+          # Patch directory to the absolute workspace path
+          sed -i "s#__DIR__#${PWD}#g" compile_commands.json
+
+          # Optional: actually compile (not required for analysis, but useful)
+          gcc -std=c17 -I. -O2 -g -c main.c -o main.o
+
 
       # Assemble Sonar args dynamically so we only enable CFamily when C files exist
       - name: Compose Sonar args
