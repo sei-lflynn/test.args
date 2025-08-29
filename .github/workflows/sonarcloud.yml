@@ -26,49 +26,76 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Prepare reports dir
-        run: mkdir -p reports
-
-      # Generate a compile_commands.json that matches the current workspace paths.
-      # In a real project, replace this with your actual build that emits the file
-      # (e.g., CMake with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON or bear/intercept-build).
-      - name: Build & emit compile_commands.json (demo)
+      - name: Build C object(s)
         run: |
           set -eux
-          gcc --version
-          # Ensure the C file exists (remove this guard if not needed)
           test -f main.c
-          # Create a proper compilation command (produces an object file)
-          cat > compile_commands.json <<'JSON'
-          [
-            {
-              "directory": "__DIR__",
-              "command": "gcc -std=c17 -I. -O2 -g -c main.c -o main.o",
-              "file": "main.c"
-            }
-          ]
-          JSON
-          # Patch directory to the absolute workspace path
-          sed -i "s#__DIR__#${PWD}#g" compile_commands.json
+          mkdir -p build
+          gcc -std=c17 -I. -O2 -g -c main.c -o build/main.o
 
-          # Optional: actually compile (not required for analysis, but useful)
-          gcc -std=c17 -I. -O2 -g -c main.c -o main.o
-
-
-      # Assemble Sonar args dynamically so we only enable CFamily when C files exist
-      - name: Compose Sonar args
-        id: sonar_args
+      # Use existing compile_commands.json if present; otherwise create one.
+      - name: Create or reuse compile_commands.json
         run: |
-          ARGS="-Dsonar.sarifReportPaths=reports/trivy.sarif,reports/semgrep.sarif"
-          if git ls-files '*.c' | grep -q .; then
-            ARGS="$ARGS -Dsonar.cfamily.compile-commands=compile_commands.json"
+          set -eux
+          if [ ! -f compile_commands.json ]; then
+            python - <<'PY'
+import json
+cc = [{
+  "directory": "/github/workspace",
+  "command": "gcc -std=c17 -I. -O2 -g -c main.c -o build/main.o",
+  "file": "main.c"
+}]
+with open("compile_commands.json","w") as f: json.dump(cc, f, indent=2)
+PY
           fi
-          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      # Normalize host paths (/home/runner/work/...) to the scanner's mount (/github/workspace)
+      - name: Normalize compile_commands paths for Sonar container
+        run: |
+          python - <<'PY'
+import json, os, pathlib
+host_root = os.environ["GITHUB_WORKSPACE"]           # e.g., /home/runner/work/owner/repo
+container_root = "/github/workspace"
+with open("compile_commands.json") as f:
+    cc = json.load(f)
+for e in cc:
+    d = e.get("directory",".")
+    # if entry starts with host workspace, map to container path + relative suffix
+    try:
+        p = pathlib.Path(d)
+        if str(p).startswith(host_root):
+            rel = os.path.relpath(str(p), host_root)
+            e["directory"] = os.path.join(container_root, rel) if rel != "." else container_root
+        else:
+            # If it's an absolute path elsewhere, force to repo root in container
+            if os.path.isabs(d):
+                e["directory"] = container_root
+    except Exception:
+        e["directory"] = container_root
+    # Ensure command is a compilation, not link
+    cmd = e.get("command","")
+    if " -c " not in f" {cmd} ":
+        # Replace any '-o main' style link with a compile of the file to build dir
+        src = e.get("file","")
+        if src:
+            e["command"] = f"gcc -std=c17 -I. -O2 -g -c {src} -o build/{os.path.splitext(os.path.basename(src))[0]}.o"
+        else:
+            e["command"] = "gcc -std=c17 -I. -O2 -g -c main.c -o build/main.o"
+with open("compile_commands.json","w") as f:
+    json.dump(cc, f, indent=2)
+# Final sanity: show entries
+print(open("compile_commands.json").read())
+PY
+
+      - name: Prepare reports dir (optional SARIF imports)
+        run: mkdir -p reports
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@4006f663ecaf1f8093e8e4abb9227f6041f52216
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}  # picked up automatically as sonar.token
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}   # picked up as sonar.token
         with:
           projectBaseDir: .
-          args: ${{ steps.sonar_args.outputs.args }}
+          args: >
+            -Dsonar.sarifReportPaths=reports/trivy.sarif,reports/semgrep.sarif
+            -Dsonar.cfamily.compile-commands=compile_commands.json
