@@ -60,41 +60,44 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           python3 - <<'PY'
-          import json, os, sys, time, urllib.parse, urllib.request, pathlib
+          import base64, json, os, sys, time, urllib.parse, urllib.request, pathlib
 
           host = os.environ["SONAR_HOST_URL"].rstrip("/")
           token = os.environ["SONAR_TOKEN"]
+
+          def fetch_json(url):
+            req = urllib.request.Request(url)
+            b64 = base64.b64encode(f"{token}:".encode("utf-8")).decode("ascii")
+            req.add_header("Authorization", f"Basic {b64}")
+            try:
+              with urllib.request.urlopen(req) as r:
+                return json.loads(r.read().decode("utf-8"))
+            except Exception as e:
+              print(f"HTTP error for URL: {url}", file=sys.stderr)
+              raise
 
           # 1) Read ceTaskId from scanner output
           taskfile = ".scannerwork/report-task.txt"
           if not os.path.exists(taskfile):
             print("report-task.txt not found", file=sys.stderr); sys.exit(1)
           ce_task_id = ""
+          ce_task_url = ""
           with open(taskfile, "r", encoding="utf-8") as f:
             for line in f:
+              line = line.strip()
               if line.startswith("ceTaskId="):
-                ce_task_id = line.strip().split("=",1)[1]
-                break
+                ce_task_id = line.split("=",1)[1]
+              elif line.startswith("ceTaskUrl="):
+                ce_task_url = line.split("=",1)[1]
+          if not ce_task_id and ce_task_url:
+            q = urllib.parse.urlparse(ce_task_url).query
+            ce_task_id = dict(urllib.parse.parse_qsl(q)).get("id","")
           if not ce_task_id:
-            # fallback: parse ceTaskUrl
-            with open(taskfile, "r", encoding="utf-8") as f:
-              for line in f:
-                if line.startswith("ceTaskUrl="):
-                  url = line.strip().split("=",1)[1]
-                  q = urllib.parse.urlparse(url).query
-                  ce_task_id = dict(urllib.parse.parse_qsl(q)).get("id","")
-                  break
-          if not ce_task_id:
-            print("Missing ceTaskId in report-task.txt", file=sys.stderr); sys.exit(1)
+            print("Missing ceTaskId in report-task.txt", file=sys.stderr)
+            with open(taskfile, "r", encoding="utf-8") as f: print(f.read(), file=sys.stderr)
+            sys.exit(1)
 
           # 2) Poll CE until SUCCESS/FAILED
-          def fetch_json(url):
-            pwman = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-            pwman.add_password(None, host, token, "")
-            opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(pwman))
-            with opener.open(url) as r:
-              return json.loads(r.read().decode("utf-8"))
-
           ce_url = f"{host}/api/ce/task?id={urllib.parse.quote(ce_task_id)}"
           for _ in range(60):
             data = fetch_json(ce_url)
@@ -105,20 +108,25 @@ jobs:
             if status == "FAILED":
               print(json.dumps(data, indent=2)); sys.exit(1)
             time.sleep(5)
+          else:
+            print("Compute Engine did not reach SUCCESS within timeout", file=sys.stderr); sys.exit(1)
 
-          # 3) Project key/org from sonar-project.properties
+          # 3) Project key and org from sonar-project.properties
           sp = "sonar-project.properties"
           if not os.path.exists(sp):
             print("sonar-project.properties missing", file=sys.stderr); sys.exit(1)
-          proj, org = "", ""
+          proj = org = ""
           with open(sp, "r", encoding="utf-8") as f:
             for line in f:
+              line=line.strip()
               if line.startswith("sonar.projectKey="):
-                proj = line.strip().split("=",1)[1]
+                proj = line.split("=",1)[1]
               elif line.startswith("sonar.organization="):
-                org = line.strip().split("=",1)[1]
+                org = line.split("=",1)[1]
           if not proj:
             print("sonar.projectKey missing", file=sys.stderr); sys.exit(1)
+          if not org:
+            print("sonar.organization missing", file=sys.stderr); sys.exit(1)
 
           # 4) Selector: PR vs branch
           event = os.environ.get("GITHUB_EVENT_NAME","")
@@ -129,9 +137,10 @@ jobs:
             selector_key = "branch"
             selector_val = os.environ.get("GITHUB_REF_NAME","main")
 
-          # 5) Page issues
-          def fetch_issues(page):
+          # 5) Page SonarCloud issues (add organization)
+          def issues_page(page:int):
             qs = {
+              "organization": org,
               "componentKeys": proj,
               "ps": "500",
               "p": str(page),
@@ -145,10 +154,11 @@ jobs:
           page = 1
           total = None
           while True:
-            data = fetch_issues(page)
-            issues.extend(data.get("issues",[]))
+            data = issues_page(page)
+            batch = data.get("issues", [])
+            issues.extend(batch)
             total = data.get("total", len(issues)) if total is None else total
-            if len(issues) >= total or not data.get("issues"):
+            if len(issues) >= total or not batch:
               break
             page += 1
 
@@ -204,7 +214,7 @@ jobs:
           pathlib.Path("reports").mkdir(parents=True, exist_ok=True)
           with open("reports/sonarcloud-findings.sarif","w",encoding="utf-8") as f:
             json.dump(sarif, f, indent=2)
-          print(f"Wrote SARIF with {len(results)} results")
+          print(f"Wrote SARIF with {len(results)} results, {len(rules)} rules")
           PY
 
       - name: Upload SARIF to Code Scanning
