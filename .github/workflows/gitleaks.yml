@@ -3,26 +3,18 @@
 # What this workflow does (in order):
 #   1) Checks out code with read-only permissions and no persisted credentials.
 #   2) Runs Gitleaks (pinned action) to scan for hard-coded secrets.
-#   3) Writes a SARIF report that GitHub Code Scanning can ingest.
-#   4) Uploads SARIF to the Security tab and also stores it as a build artifact.
+#   3) Writes a SARIF report to a pre-created path (so uploads never fail due to missing dirs).
+#   4) Uploads SARIF to the Security tab and stores it as an artifact (if present).
 #
-# Why these patterns (best practices):
-#   • Default-deny permissions (read-only at workflow level).
-#   • Elevate only where needed (security-events: write in this job).
-#   • Pin actions to commit SHAs (tamper-resistance, reproducibility).
-#   • Guard untrusted PRs: use pull_request (not pull_request_target).
-#   • Concurrency cancels superseded runs to avoid CI pile-ups.
-#   • Timeouts cap spend and fail fast.
-#   • Hardened egress: start with audit; later switch to block + allowlist.
-#   • Scoped checkout creds: no persisted token since we don’t push.
-#   • Results are auditable: SARIF uploaded and saved as an artifact.
-#
-# Notes:
-#   • If you keep a custom allowlist config (e.g., .gitleaks.toml), uncomment the
-#     `config-path` line below and commit that file to the repo.
-#   • By default, Gitleaks exits non-zero on findings. We mark the step
-#     `continue-on-error: true` so subsequent upload steps still run and the SARIF
-#     makes it to the Security tab. Remove that line to *fail the job on leaks*.
+# Security & reliability patterns implemented:
+#   • Default-deny permissions (read-only at the workflow level).
+#   • Least privilege at the job (add security-events: write only where needed).
+#   • SHA-pinned actions (reproducible, tamper-resistant).
+#   • Concurrency to cancel superseded runs.
+#   • Timeouts to cap spend and fail fast.
+#   • Egress hardening (audit now; flip to block + allowlist later).
+#   • Scoped checkout credentials (no push → don’t persist token).
+#   • Guard uploads with file existence checks.
 
 name: gitleaks
 
@@ -33,99 +25,94 @@ on:
     - cron: "0 4 * * *"   # daily at 04:00 UTC
   workflow_dispatch:
 
-# Cancel older in-flight runs for the same ref/PR (saves time and CI minutes)
+# Cancel older in-flight runs for same ref/PR
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
-# Default-deny at the workflow level (read-only). Job elevates minimally.
+# Default-deny at workflow level
 permissions:
   contents: read
 
 jobs:
   scan:
     name: Gitleaks scan → SARIF
-    runs-on: ubuntu-24.04          # Pin runner for reproducibility
-    timeout-minutes: 20            # Upper bound for this job (tune as needed)
+    runs-on: ubuntu-24.04                 # Explicit runner for reproducibility
+    timeout-minutes: 20
 
-    # Least privilege for this job:
-    # - contents: read            → checkout
-    # - security-events: write    → upload SARIF to Code Scanning
-    # - actions: read             → required in private repos so upload-sarif can read run status
+    # Least privilege for this job
     permissions:
-      contents: read
-      security-events: write
-      actions: read
+      contents: read                      # checkout
+      security-events: write              # upload SARIF to Code Scanning
+      actions: read                       # needed in private repos for upload-sarif
 
     env:
-      REPORT_PATH: reports/gitleaks.sarif  # Central place to change output path
+      # Use a single source of truth for report location.
+      # Absolute path ensures the Docker action writes into the mounted workspace.
+      REPORT_DIR: /github/workspace/reports
+      REPORT_FILE: gitleaks.sarif
+      REPORT_PATH: /github/workspace/reports/gitleaks.sarif
 
     steps:
-      # Harden egress to reduce exfiltration risk if a step is compromised.
-      # Start with 'audit' to learn endpoints. Later switch to 'block' + allowlist.
-      - name: Harden the runner (Audit outbound egress)
+      # Harden network egress. Start in audit; switch to block + allowlist when stable.
+      - name: Harden runner (egress audit)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
-          # When stable, prefer:
+          # For block mode later, uncomment and trim:
           # egress-policy: block
           # allowed-endpoints: >
           #   api.github.com:443
           #   uploads.github.com:443
           #   objects.githubusercontent.com:443
           #   github.com:443
-          #   # gitleaks container normally doesn't need network; keep list tight.
 
-      # Checkout with no persisted credentials (we’re not pushing in this job)
+      # Checkout with no persisted credentials (we’re not pushing)
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          fetch-depth: 0  # full history; useful if you scan history or baselines
+          fetch-depth: 0                   # full history; helpful if you later scan history
 
-      # Run Gitleaks via the official action (pinned to a commit SHA).
-      # - `continue-on-error: true` ensures we still upload SARIF even if leaks are found.
-      #   Remove it to fail the job on leaks (strict gate).
-      # - `args`:
-      #     --redact             → hide secret values in logs/artifacts
-      #     --report-format sarif→ output SARIF v2.1.0
-      #     --report-path        → where to write the SARIF
-      #     --no-banner          → quieter logs
-      #     --verbose            → more detail (tune to taste)
-      # - If you keep an allowlist config, add: config-path: .gitleaks.toml
+      # PREP: Ensure the report folder exists (fixes “Path does not exist” on upload)
+      - name: Prepare report directory
+        run: mkdir -p "${REPORT_DIR}"
+
+      # Run Gitleaks (pinned). We pass absolute paths so the Docker action
+      # writes exactly where we expect. `continue-on-error` keeps the job going
+      # so we can still upload SARIF even if leaks are found.
       - name: Run Gitleaks
+        id: gitleaks
         continue-on-error: true
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         with:
           args: >-
             detect
+            --source /github/workspace
             --redact
             --no-banner
             --verbose
             --report-format sarif
             --report-path "${{ env.REPORT_PATH }}"
+          # If you maintain an allowlist/baseline, commit .gitleaks.toml and uncomment:
           # config-path: .gitleaks.toml
         env:
-          # GitHub’s token (scoped to this job’s minimal permissions).
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Only required for Orgs using Gitleaks Pro features. Safe if empty on forks.
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}      # minimal-scoped token for the job
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }} # only needed for Org features; safe if empty on forks
 
-      # Upload SARIF to Code Scanning (Security tab). Category keeps tools distinct.
-      # `if: always()` runs even if the previous step reported leaks (non-zero).
+      # Upload SARIF to Code Scanning ONLY if it exists
       - name: Upload SARIF to Code Scanning
-        if: always()
+        if: always() && hashFiles('reports/gitleaks.sarif') != ''
         uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
         with:
-          sarif_file: ${{ env.REPORT_PATH }}
+          sarif_file: reports/gitleaks.sarif
           category: gitleaks
 
-      # Keep an auditable copy of the SARIF with explicit retention.
-      # Avoid uploading anything sensitive.
+      # Keep an auditable copy as an artifact ONLY if it exists
       - name: Upload SARIF as artifact
-        if: always()
+        if: always() && hashFiles('reports/gitleaks.sarif') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gitleaks-sarif
-          path: ${{ env.REPORT_PATH }}
+          path: reports/gitleaks.sarif
           retention-days: 14
