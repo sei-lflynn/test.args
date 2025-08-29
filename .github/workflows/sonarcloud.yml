@@ -26,11 +26,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
 
-      - name: Set up Python (pinned)
-        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4.9.1
-        with:
-          python-version: "3.12"
-
       - name: Prepare reports directory and compile_commands.json
         run: |
           mkdir -p reports
@@ -39,19 +34,24 @@ jobs:
           echo '  { "directory": "'"${PWD}"'", "command": "gcc -std=c17 -I. -O2 -g main.c -o main", "file": "main.c" }' >> compile_commands.json
           echo ']' >> compile_commands.json
 
-      - name: Run Trivy scan
+      - name: Run Trivy scan (version pinned)
         uses: aquasecurity/trivy-action@f9424c10c36e288d5fa79bd3dfd1aeb2d6eae808
         with:
+          version: v0.64.1
           scan-type: fs
           format: sarif
           output: reports/trivy.sarif
           exit-code: 0
 
-      - name: Install Semgrep (pinned)
-        run: python3 -m pip install --upgrade "semgrep==1.77.0"
-
-      - name: Run Semgrep scan
-        run: semgrep --config p/ci --sarif --output reports/semgrep.sarif .
+      - name: Run Semgrep scan (pinned Docker digest; no pip)
+        # Pin the Semgrep CLI via an immutable Docker image digest
+        uses: docker://semgrep/semgrep:1.127.1@sha256:85f9de554201cc891c470774bb93a7f4faf41ea198ddccc34a855b53f7a51443
+        with:
+          args: >
+            semgrep scan
+            --config p/ci
+            --sarif --output reports/semgrep.sarif
+            --metrics=off
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@4006f663ecaf1f8093e8e4abb9227f6041f52216
