@@ -1,29 +1,15 @@
-# Bandit security scan with least-privilege, pinning, and SARIF upload
+# Bandit security scan with native SARIF, hardened & pinned
 # -----------------------------------------------------------------------------
-# What this workflow does (in order):
-#   1) Checks out your code with read-only permissions and no persisted creds.
-#   2) Sets up a pinned Python toolchain; uses pip cache only when dependency files exist.
-#   3) Installs a pinned version of Bandit.
-#   4) Runs Bandit recursively and writes findings to JSON.
-#   5) Converts Bandit JSON to SARIF (the format GitHub Code Scanning understands).
-#   6) Uploads SARIF to Code Scanning and also stores it as a build artifact for auditing.
-#
-# Key principles implemented:
-#   • Default-deny permissions at the workflow level (read-only by default).
-#   • Elevate only where needed at the job (security-events: write for SARIF upload).
-#   • Pin every third-party action to an exact commit SHA for tamper resistance.
-#   • Harden runner egress (start in audit mode; later switch to block + allowlist).
-#   • Concurrency cancels superseded runs to save time/CI minutes.
-#   • Timeouts on job/steps to prevent hangs.
-#   • Scoped checkout credentials (no push, so don’t persist credentials).
-#   • Reproducible toolchain (fixed runner + pinned Python + pinned Bandit).
-#   • Dependency-aware pip caching to avoid “no file matched” errors.
-#   • SARIF uploaded to Code Scanning and retained as an artifact (auditable results).
+# What this does:
+#  1) Checkout (read-only, no persisted creds)
+#  2) Set up Python (pip cache only if dep files exist)
+#  3) Install Bandit with SARIF formatter (bandit[sarif])
+#  4) Run Bandit → SARIF
+#  5) Upload SARIF to GitHub Code Scanning + keep an artifact copy
 
 name: Bandit
 
 on:
-  # Run on main branch changes that affect Python or Bandit config.
   push:
     branches: [ "main" ]
     paths:
@@ -36,7 +22,6 @@ on:
       - "bandit.yaml"
       - "bandit.yml"
       - ".github/workflows/bandit.yml"
-  # Run on PRs targeting main; safe for forks (no write scopes exposed).
   pull_request:
     branches: [ "main" ]
     paths:
@@ -49,62 +34,58 @@ on:
       - "bandit.yaml"
       - "bandit.yml"
       - ".github/workflows/bandit.yml"
-  # Optional weekly schedule. Adjust cadence as needed.
   schedule:
     - cron: "37 14 * * 1"
-  # Manual trigger (good for testing from the UI).
   workflow_dispatch:
 
-# Cancel older in-flight runs for the same ref/PR to avoid CI pile-ups.
+# Cancel superseded runs to avoid CI pile-ups
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
-# Default-deny: read-only by default; the job elevates only what it needs.
+# Default-deny at workflow level
 permissions:
   contents: read
 
 jobs:
   bandit:
     name: Bandit scan → SARIF
-    runs-on: ubuntu-24.04            # Explicit runner for reproducibility
-    timeout-minutes: 15              # Cap job runtime
-
-    # Job-level permissions (least privilege):
-    # - contents: read → needed by checkout
-    # - security-events: write → needed to upload SARIF to Code Scanning
-    # - actions: read → required in private repos so upload-sarif can read run status
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Least privilege: only what we need in this job
     permissions:
-      contents: read
-      security-events: write
-      actions: read
+      contents: read           # checkout
+      security-events: write   # upload SARIF to Code Scanning
+      actions: read            # needed in private repos for upload-sarif
 
-    # Centralize versions/paths to make maintenance easy.
     env:
-      BANDIT_VERSION: "1.8.6"        # Pinned Bandit version; bump intentionally
+      BANDIT_VERSION: "1.8.6"        # >=1.7.8 supports SARIF (via extra)
       SARIF_OUT: "reports/bandit.sarif"
-      BANDIT_JSON: "reports/bandit.json"
 
     steps:
-      # Harden outbound network. Start in audit mode to learn endpoints used.
-      # When stable, switch to:
-      #   egress-policy: block
-      #   allowed-endpoints: pypi.org:443, files.pythonhosted.org:443, api.github.com:443, uploads.github.com:443,
-      #                      objects.githubusercontent.com:443, github.com:443
-      - name: Harden the runner (Audit outbound egress)
+      # Harden runner egress. Start in audit; switch to block + allowlist when stable.
+      - name: Harden runner (egress audit)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
+          # For block mode, uncomment and trim:
+          # egress-policy: block
+          # allowed-endpoints: >
+          #   pypi.org:443
+          #   files.pythonhosted.org:443
+          #   api.github.com:443
+          #   uploads.github.com:443
+          #   objects.githubusercontent.com:443
+          #   github.com:443
 
-      # Checkout with no persisted creds (we’re not pushing).
-      - name: Checkout repository
+      # Checkout with no persisted creds
+      - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
           fetch-depth: 0
 
-      # Detect dependency files first; only then enable pip cache.
-      # This prevents setup-python from erroring when patterns don’t exist.
+      # Detect dependency files to decide whether to enable pip cache
       - name: Detect dependency files for pip cache
         id: deps
         shell: bash
@@ -119,14 +100,13 @@ jobs:
               printf '%s\n' "${files[@]}"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
-            echo "Detected dependency files:"
-            printf '  - %s\n' "${files[@]}"
+            printf 'Dependency files detected:\n'; printf '  - %s\n' "${files[@]}"
           else
             echo "have_deps=false" >> "$GITHUB_OUTPUT"
-            echo "No dependency files detected; Python will be set up without pip cache."
+            echo "No dependency files; Python will be set up without pip cache."
           fi
 
-      # Python with pip cache (only when deps exist).
+      # Setup Python with pip cache (only when deps exist)
       - name: Set up Python (with pip cache)
         if: ${{ steps.deps.outputs.have_deps == 'true' }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -135,35 +115,34 @@ jobs:
           cache: "pip"
           cache-dependency-path: ${{ steps.deps.outputs.paths }}
 
-      # Python without pip cache (when no deps).
+      # Fallback: setup Python without pip cache
       - name: Set up Python (no cache)
         if: ${{ steps.deps.outputs.have_deps != 'true' }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
-      # Install a pinned Bandit version for reproducibility.
-      - name: Install Bandit (pinned)
+      # Install Bandit with SARIF formatter support
+      # Docs: bandit >=1.7.8 provides SARIF via the 'sarif' extra: pip install bandit[sarif]
+      - name: Install Bandit (pinned, SARIF-enabled)
         shell: bash
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
-          python -m pip install "bandit[toml]==${BANDIT_VERSION}"
+          # Include toml extra if you keep config in pyproject.toml
+          python -m pip install "bandit[sarif,toml]==${BANDIT_VERSION}"
           bandit --version
         timeout-minutes: 3
 
-      # Run Bandit recursively:
-      # - JSON output (Bandit does not support SARIF directly)
-      # - --exit-zero keeps CI green; remove it to enforce gating
-      # - --exclude skips common noise dirs; adjust for your repo
-      - name: Run Bandit and write JSON
+      # Run Bandit with native SARIF output
+      - name: Run Bandit → SARIF
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "$(dirname "${BANDIT_JSON}")"
+          mkdir -p "$(dirname "${SARIF_OUT}")"
           bandit -r . \
-            --format json \
-            --output "${BANDIT_JSON}" \
+            --format sarif \
+            --output "${SARIF_OUT}" \
             --severity-level all \
             --confidence-level all \
             --exit-zero \
@@ -171,101 +150,14 @@ jobs:
             --exclude .git,.venv,venv,.tox,site-packages,dist,build
         timeout-minutes: 5
 
-      # Convert Bandit JSON → SARIF 2.1.0 (the format GitHub Code Scanning ingests).
-      # The converter is intentionally small and self-contained.
-      - name: Convert Bandit JSON to SARIF
-        shell: bash
-        run: |
-          python - <<'PY'
-          import json, sys, os, pathlib, hashlib
-          bandit_json = os.environ.get("BANDIT_JSON", "reports/bandit.json")
-          sarif_out   = os.environ.get("SARIF_OUT", "reports/bandit.sarif")
-
-          # Load Bandit JSON; default to empty structure if missing/broken.
-          data = {}
-          if os.path.exists(bandit_json):
-            with open(bandit_json, "r", encoding="utf-8") as f:
-              try:
-                data = json.load(f)
-              except Exception:
-                data = {}
-          results = data.get("results", [])
-
-          # Map Bandit severities to SARIF levels.
-          sev_to_level = {"HIGH":"error","MEDIUM":"warning","LOW":"note"}
-
-          rules = {}
-          sarif_results = []
-          for it in results:
-            test_id   = it.get("test_id","B000")
-            test_name = it.get("test_name","bandit-rule")
-            msg       = it.get("issue_text","")
-            path      = it.get("filename","")
-            line      = int(it.get("line_number", 1) or 1)
-            sev       = (it.get("issue_severity","LOW") or "LOW").upper()
-            conf      = (it.get("issue_confidence","LOW") or "LOW").upper()
-            more      = it.get("more_info","")
-            code      = it.get("code","")
-
-            # Add each rule once to SARIF tool.driver.rules
-            if test_id not in rules:
-              rules[test_id] = {
-                "id": test_id,
-                "name": test_name,
-                "shortDescription": {"text": msg[:120]},
-                "helpUri": more or None
-              }
-
-            # Basic fingerprint to help deduplicate similar findings
-            fp_src = f"{test_id}|{path}|{line}|{hashlib.sha1(code.encode('utf-8','ignore')).hexdigest()}"
-            sarif_results.append({
-              "ruleId": test_id,
-              "level": sev_to_level.get(sev, "warning"),
-              "message": {"text": msg},
-              "locations": [{
-                "physicalLocation": {
-                  "artifactLocation": {"uri": path, "uriBaseId": "PROJECT_ROOT"},
-                  "region": {"startLine": line}
-                }
-              }],
-              "properties": {
-                "banditSeverity": sev,
-                "banditConfidence": conf,
-                "testName": test_name
-              },
-              "fingerprints": { "banditFingerprint": hashlib.sha1(fp_src.encode()).hexdigest() }
-            })
-
-          sarif = {
-            "version": "2.1.0",
-            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-            "runs": [{
-              "tool": {
-                "driver": {
-                  "name": "Bandit",
-                  "informationUri": "https://pypi.org/project/bandit/",
-                  "rules": [r for r in rules.values() if r]
-                }
-              },
-              "results": sarif_results
-            }]
-          }
-
-          pathlib.Path(os.path.dirname(sarif_out)).mkdir(parents=True, exist_ok=True)
-          with open(sarif_out, "w", encoding="utf-8") as f:
-            json.dump(sarif, f, indent=2)
-          print(f"Wrote SARIF with {len(sarif_results)} results, {len(rules)} rules")
-          PY
-
-      # Publish SARIF to GitHub Code Scanning (Security tab).
-      # Use a category so Bandit’s alerts don’t collide with other tools’ uploads.
+      # Publish SARIF to Code Scanning (Security tab)
       - name: Upload SARIF to Code Scanning
         uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
         with:
           sarif_file: ${{ env.SARIF_OUT }}
           category: bandit
 
-      # Keep an auditable copy of the SARIF with controlled retention.
+      # Keep an auditable copy with explicit retention
       - name: Upload SARIF as artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
