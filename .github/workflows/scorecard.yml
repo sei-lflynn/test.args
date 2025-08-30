@@ -1,83 +1,166 @@
-# This workflow uses actions that are not certified by GitHub. They are provided
-# by a third-party and are governed by separate terms of service, privacy
-# policy, and support documentation.
+# OpenSSF Scorecard supply-chain security (hardened, pinned, least-privilege)
+# =============================================================================
+# What this workflow does (high level):
+#   1) Runs OpenSSF Scorecard against the repo to assess supply-chain posture.
+#   2) Writes a SARIF report (results.sarif).
+#   3) Uploads SARIF to GitHub Code Scanning (Security tab) in a separate job
+#      so only that job gets 'security-events: write'.
+#   4) (Public repos) Optionally publishes results to the OpenSSF API to enable badges.
+#
+# Why these patterns (best practices you requested):
+#   • Default-deny permissions at the workflow level; jobs elevate only what they need.
+#   • Pin third-party actions to commit SHAs for tamper resistance and reproducibility.
+#   • Guard untrusted PRs (use pull_request, not pull_request_target).
+#   • Concurrency cancels superseded runs to avoid CI pile-ups.
+#   • Timeouts cap spend and fail fast.
+#   • Harden runner egress (start audit; later switch to block + allowlist).
+#   • Scoped checkout credentials (we never push in this workflow).
+#   • Explicit runner version (ubuntu-24.04).
+#   • Separate upload job keeps 'security-events: write' scoped to the smallest surface.
+#
+# Notes on Scorecard behavior:
+#   • 'publish_results: true' only works on the *default branch* of *public* repos.
+#   • This workflow runs for PRs (so you see findings on proposed changes) and for pushes
+#     to the default branch (for published results / badges).
+#   • The 'branch_protection_rule' trigger lets Branch-Protection check refresh when rules change.
 
 name: Scorecard supply-chain security
+
 on:
-  # For Branch-Protection check. Only the default branch is supported. See
-  # https://github.com/ossf/scorecard/blob/main/docs/checks.md#branch-protection
+  # Runs when branch protection rules change (Branch-Protection check refresh).
   branch_protection_rule:
-  # To guarantee Maintained check is occasionally updated. See
-  # https://github.com/ossf/scorecard/blob/main/docs/checks.md#maintained
+
+  # Weekly maintenance run (keeps Maintained check fresh). Adjust cadence as needed.
   schedule:
     - cron: '40 16 * * 1'
-  push:
-    # branches: [ "main" ]
 
-# Declare default permissions as read only.
-permissions: read-all
+  # Run on pushes to default branch (publishing supported only from default).
+  push:
+    branches: [ "main" ]  # ← tune to your default branch name if different
+
+  # Run on PRs to surface findings before merge.
+  pull_request:
+    branches: [ "main" ]  # ← tune to your branching model
+    paths:
+      # Limit to files that meaningfully influence Scorecard checks or your supply chain.
+      - "**/*"
+      - ".github/workflows/scorecard.yml"
+
+# Cancel older in-flight runs on the same ref/PR (prevents CI pile-ups).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# Default-deny at the workflow level (read-only unless elevated by a job).
+permissions:
+  contents: read
 
 jobs:
+  # ────────────────────────────── Job 1: Analyze ──────────────────────────────
   analysis:
     name: Scorecard analysis
-    runs-on: ubuntu-latest
-    # `publish_results: true` only works when run from the default branch. conditional can be removed if disabled.
-    if: github.event.repository.default_branch == github.ref_name || github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04                       # Explicit runner for reproducibility
+    timeout-minutes: 15                         # Cap overall runtime
+
+    # Run on PRs and on the default branch (for publishing). The publish knob below
+    # is gated to default branch; PRs won’t attempt to publish externally.
+    # Keep least privilege here: no 'security-events: write' in this job.
     permissions:
-      # Needed to upload the results to code-scanning dashboard.
-      security-events: write
-      # Needed to publish results and get a badge (see publish_results below).
-      id-token: write
-      # Uncomment the permissions below if installing in a private repository.
-      # contents: read
-      # actions: read
+      contents: read
+      id-token: write                           # Needed only if we publish results to OpenSSF (public repos)
+
+    # Expose whether we produced a SARIF so the upload job can decide to run.
+    outputs:
+      has_sarif: ${{ steps.check.outputs.has_sarif }}
 
     steps:
-      - name: Harden the runner (Audit all outbound calls)
+      # Harden network egress. Start with 'audit'; after a few clean runs,
+      # switch to:
+      #   egress-policy: block
+      #   allowed-endpoints: >
+      #     api.github.com:443
+      #     github.com:443
+      #     objects.githubusercontent.com:443
+      # (Scorecard fetches metadata from GitHub; keep the allowlist minimal.)
+      - name: Harden the runner (egress audit)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
 
-      - name: "Checkout code"
+      # Checkout with no persisted credentials (we don’t push in this workflow).
+      - name: Checkout code
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+          fetch-depth: 0  # Some checks benefit from history (e.g., Maintained)
 
-      - name: "Run analysis"
+      # Run the Scorecard action (pinned). We always write a SARIF report.
+      # 'publish_results' is evaluated as a string 'true'/'false'. We set it to 'true'
+      # only if we are on the default branch; otherwise 'false'.
+      - name: Run Scorecard analysis
         uses: ossf/scorecard-action@05b42c624433fc40578a4040d5cf5e36ddca8cde # v2.4.2
         with:
           results_file: results.sarif
           results_format: sarif
-          # (Optional) "write" PAT token. Uncomment the `repo_token` line below if:
-          # - you want to enable the Branch-Protection check on a *public* repository, or
-          # - you are installing Scorecard on a *private* repository
-          # To create the PAT, follow the steps in https://github.com/ossf/scorecard-action?tab=readme-ov-file#authentication-with-fine-grained-pat-optional.
+          # Publish to OpenSSF only on default branch (public repos). Private repos ignore this anyway.
+          publish_results: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          # Optional: enable Branch-Protection check on public repos or use in private repos with a PAT
           # repo_token: ${{ secrets.SCORECARD_TOKEN }}
-
-          # Public repositories:
-          #   - Publish results to OpenSSF REST API for easy access by consumers
-          #   - Allows the repository to include the Scorecard badge.
-          #   - See https://github.com/ossf/scorecard-action#publishing-results.
-          # For private repositories:
-          #   - `publish_results` will always be set to `false`, regardless
-          #     of the value entered here.
-          publish_results: true
-
-          # (Optional) Uncomment file_mode if you have a .gitattributes with files marked export-ignore
+          # Optional: if your .gitattributes marks files as export-ignore
           # file_mode: git
 
-      # Upload the results as artifacts (optional). Commenting out will disable uploads of run results in SARIF
-      # format to the repository Actions tab.
-      - name: "Upload artifact"
+      # Check whether the SARIF file exists; expose a boolean output for the next job.
+      - name: Check SARIF exists
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -s "results.sarif" ]]; then
+            echo "has_sarif=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_sarif=false" >> "$GITHUB_OUTPUT"
+            echo "No SARIF produced."
+          fi
+
+      # Keep an auditable copy of results with controlled retention.
+      - name: Upload SARIF as artifact
+        if: always() && steps.check.outputs.has_sarif == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: SARIF file
+          name: scorecard-sarif
           path: results.sarif
-          retention-days: 5
+          retention-days: 14
 
-      # Upload the results to GitHub's code scanning dashboard (optional).
-      # Commenting out will disable upload of results to your repo's Code Scanning dashboard
-      - name: "Upload to code-scanning"
+  # ───────────────────────────── Job 2: Upload to Code Scanning ─────────────────────────────
+  upload-to-code-scanning:
+    name: Upload Scorecard SARIF to Code Scanning
+    needs: analysis
+    # Only run if analysis produced a SARIF file.
+    if: ${{ needs.analysis.outputs.has_sarif == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    # Only this job needs the ability to write security events.
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      # Retrieve the SARIF produced by Job 1.
+      - name: Download SARIF artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: scorecard-sarif
+          path: .
+
+      # Upload SARIF to GitHub Code Scanning (Security tab). Give it a distinct category.
+      - name: Upload to Code Scanning
         uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
         with:
           sarif_file: results.sarif
+          category: ossf-scorecard
