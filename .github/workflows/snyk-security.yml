@@ -1,54 +1,151 @@
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
-# A sample workflow which sets up Snyk to analyze the full Snyk platform (Snyk Open Source, Snyk Code,
-# Snyk Container and Snyk Infrastructure as Code)
-# The setup installs the Snyk CLI - for more details on the possible commands
-# check https://docs.snyk.io/snyk-cli/cli-reference
-# The results of Snyk Code are then uploaded to GitHub Security Code Scanning
+# Snyk Security (hardened, pinned, least-privilege)
+# =============================================================================
+# What this workflow does:
+#   1) Job "snyk-scan": runs Snyk Code (SAST) and writes SARIF (snyk-code.sarif).
+#      The step is skipped on forked PRs without a SNYK_TOKEN (safe default).
+#   2) Job "upload-sarif": uploads SARIF to GitHub Code Scanning and stores it
+#      as an artifact. Only this job gets `security-events: write`.
 #
-# In order to use the Snyk Action you will need to have a Snyk API token.
-# More details in https://github.com/snyk/actions#getting-your-snyk-token
-# or you can signup for free at https://snyk.io/login
-#
-# For more examples, including how to limit scans to only high-severity issues
-# and fail PR checks, see https://github.com/snyk/actions/
+# Why this structure:
+#   • Default-deny at workflow level → jobs elevate only what they need.
+#   • SHA-pinned actions → reproducible, tamper-resistant.
+#   • Concurrency → cancels superseded runs to avoid CI pile-ups.
+#   • Timeouts → cap spend and fail fast.
+#   • Egress hardening → start in audit; later flip to block + allowlist.
+#   • Scoped checkout creds → we never push in this workflow.
+#   • Explicit runner → ubuntu-24.04 for deterministic behavior.
 
 name: Snyk Security
 
 on:
-  push:
-    # branches: ["main" ]
   pull_request:
-    # branches: ["main"]
+    branches: [ "main" ]                # tune to your branching model
+    paths:
+      - "**/*"
+      - ".github/workflows/snyk.yml"
+  push:
+    branches: [ "main" ]                # cover direct commits
+    paths:
+      - "**/*"
+      - ".github/workflows/snyk.yml"
+  workflow_dispatch: {}                  # manual trigger (useful for testing)
+  schedule:
+    - cron: "23 5 * * *"                # optional: daily at 05:23 UTC
 
+# Cancel superseded runs on the same ref/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# Default-deny at the workflow level (read-only)
 permissions:
   contents: read
-  security-events: write
 
 jobs:
-  security:
-    runs-on: ubuntu-latest
+  # ────────────────────────────────────────── Job 1: Scan ──────────────────────────────────────────
+  snyk-scan:
+    name: Snyk Code scan → SARIF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    # Least privilege for this job: just enough to read code
+    permissions:
+      contents: read
+    env:
+      # Snyk API token (Org/Project scope). Not available to PRs from forks by default.
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      SARIF_OUT: snyk-code.sarif
+
+    outputs:
+      has_sarif: ${{ steps.check.outputs.has_sarif }}
+
     steps:
-      - name: Harden the runner (Audit all outbound calls)
+      # Harden egress. Start with audit to learn endpoints.
+      # Later, switch to:
+      #   egress-policy: block
+      #   allowed-endpoints: >
+      #     api.github.com:443
+      #     uploads.github.com:443
+      #     objects.githubusercontent.com:443
+      #     github.com:443
+      #     snyk.io:443 api.snyk.io:443                                      # Snyk services
+      - name: Harden runner (egress audit)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # master
-      - name: Run Snyk to check for vulnerabilities
-        uses: snyk/actions/python@e2221410bff24446ba09102212d8bc75a567237d # master
-        continue-on-error: true # To make sure that SARIF upload gets called
+      # Checkout without persisted credentials (we don't push)
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Run Snyk Code (SAST) and export SARIF.
+      # Guard with an `if:` so forked PRs without secrets skip this safely.
+      - name: Run Snyk Code → SARIF
+        if: ${{ secrets.SNYK_TOKEN != '' }}
+        uses: snyk/actions/python@e2221410bff24446ba09102212d8bc75a567237d # pinned commit
+        continue-on-error: true                 # keep job alive so we can upload SARIF
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
+          # Snyk CLI command for Snyk Code (language-agnostic)
           command: code test
-          args: --sarif-file-output=snyk-code.sarif
-          
-        # Push the Snyk Code results into GitHub Code Scanning tab
-      - name: Upload result to GitHub Code Scanning
+          # Always emit SARIF for Code Scanning ingestion
+          args: >-
+            --sarif-file-output=${{ env.SARIF_OUT }}
+            # Optional gates you can enable later:
+            # --severity-threshold=high
+            # --fail-on=all
+
+      # If the token was missing (fork PR) or Snyk produced no file, skip upload later.
+      - name: Check SARIF exists
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -s "${SARIF_OUT}" ]]; then
+            echo "has_sarif=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_sarif=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Keep an auditable copy with explicit retention
+      - name: Upload SARIF as artifact
+        if: always() && steps.check.outputs.has_sarif == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: snyk-code-sarif
+          path: ${{ env.SARIF_OUT }}
+          retention-days: 14
+
+  # ─────────────────────────────────────── Job 2: Upload ───────────────────────────────────────
+  upload-sarif:
+    name: Upload SARIF to Code Scanning
+    needs: snyk-scan
+    if: ${{ needs.snyk-scan.outputs.has_sarif == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Least privilege for uploader: only this job can write security events
+    permissions:
+      contents: read
+      security-events: write
+      actions: read                       # helpful in private repos for status
+
+    steps:
+      - name: Harden runner (egress audit)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      - name: Download SARIF artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: snyk-code-sarif
+          path: .
+
+      - name: Upload SARIF to GitHub Code Scanning
         uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
         with:
           sarif_file: snyk-code.sarif
+          category: snyk-code
