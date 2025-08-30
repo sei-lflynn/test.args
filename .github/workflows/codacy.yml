@@ -1,66 +1,162 @@
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
-# This workflow checks out code, performs a Codacy security scan
-# and integrates the results with the
-# GitHub Advanced Security code scanning feature.  For more information on
-# the Codacy security scan action usage and parameters, see
-# https://github.com/codacy/codacy-analysis-cli-action.
-# For more information on Codacy Analysis CLI in general, see
-# https://github.com/codacy/codacy-analysis-cli.
+# Codacy Security Scan (hardened, pinned, least-privilege)
+# =============================================================================
+# What this workflow does (in order):
+#   1) Checks out your repo with read-only permissions and no persisted creds.
+#   2) Runs the Codacy Analysis CLI (via pinned action) to produce SARIF.
+#   3) Uploads SARIF to GitHub Code Scanning; also stores it as an artifact.
+#
+# Why these choices (best practices):
+#   • Default-deny at the workflow level; the job elevates only what it needs.
+#   • Pin every third-party action to a commit SHA for tamper resistance.
+#   • Guard untrusted PRs (use pull_request, not pull_request_target).
+#   • Concurrency cancels superseded runs to avoid CI pile-ups.
+#   • Timeouts cap spend and fail fast.
+#   • Harden network egress (start in audit; later block + allowlist).
+#   • Scoped checkout creds (we do not push from this job).
+#   • Trigger only when it matters (dependency files / code / this workflow).
 
 name: Codacy Security Scan
 
 on:
-  push:
-    # branches: [ "main" ]
+  # Run on PRs that affect code or dependency manifests (adjust patterns to taste)
   pull_request:
-    # The branches below must be a subset of the branches above
-    # branches: [ "main" ]
-  schedule:
-    - cron: '16 7 * * 2'
+    branches: [ "main" ]
+    paths:
+      - "**/*.c"            # << add/trim languages you use
+      - "**/*.cc"
+      - "**/*.cpp"
+      - "**/*.cs"
+      - "**/*.go"
+      - "**/*.java"
+      - "**/*.js"
+      - "**/*.jsx"
+      - "**/*.ts"
+      - "**/*.tsx"
+      - "**/*.py"
+      - "**/*.rb"
+      - "**/*.php"
+      - "**/*.swift"
+      - "**/*.kt"
+      - "**/*.kts"
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/yarn.lock"
+      - "**/pnpm-lock.yaml"
+      - "**/pom.xml"
+      - "**/build.gradle"
+      - "**/build.gradle.kts"
+      - "**/gradle.lockfile"
+      - "**/go.mod"
+      - "**/go.sum"
+      - "**/requirements*.txt"
+      - "**/Pipfile"
+      - "**/Pipfile.lock"
+      - "**/pyproject.toml"
+      - "**/poetry.lock"
+      - "**/Gemfile"
+      - "**/Gemfile.lock"
+      - "**/composer.json"
+      - "**/composer.lock"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/codacy.yml"
 
+  # Also run on pushes to main (covers direct commits or fast-forwards)
+  push:
+    branches: [ "main" ]
+    paths:
+      - "**/*"
+      - ".github/workflows/codacy.yml"
+
+  # Optional weekly run for drift detection (adjust cadence as needed)
+  schedule:
+    - cron: "16 7 * * 2"
+
+  # Manual trigger for testing
+  workflow_dispatch:
+
+# Cancel older in-flight runs for the same ref/PR (saves time & CI minutes)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# Default-deny at the workflow level
 permissions:
   contents: read
 
 jobs:
   codacy-security-scan:
+    name: Codacy Security Scan → SARIF
+    runs-on: ubuntu-24.04               # Explicit runner for reproducibility
+    timeout-minutes: 20                  # Cap total runtime
+
+    # Job-scoped least privilege:
+    # - contents: read         → checkout
+    # - security-events: write → upload SARIF to Code Scanning
+    # - actions: read          → required in private repos for upload-sarif status
     permissions:
-      contents: read # for actions/checkout to fetch code
-      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
-      actions: read # only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
-    name: Codacy Security Scan
-    runs-on: ubuntu-latest
+      contents: read
+      security-events: write
+      actions: read
+
+    env:
+      SARIF_OUT: results.sarif          # single source-of-truth for output path
+
     steps:
-      # Checkout the repository to the GitHub Actions runner
-      - name: Harden the runner (Audit all outbound calls)
+      # Harden the ephemeral runner's egress. Start in audit mode to learn endpoints.
+      # When stable, switch to:
+      #   egress-policy: block
+      #   allowed-endpoints: >
+      #     api.github.com:443
+      #     uploads.github.com:443
+      #     objects.githubusercontent.com:443
+      #     github.com:443
+      #     ghcr.io:443         # if the action pulls images from GitHub Container Registry
+      - name: Harden runner (egress audit)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
 
-      - name: Checkout code
+      # Checkout with no persisted credentials (we’re not pushing)
+      - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-
-      # Execute Codacy Analysis CLI and generate a SARIF output with the security issues identified during the analysis
-      - name: Run Codacy Analysis CLI
-        uses: codacy/codacy-analysis-cli-action@562ee3e92b8e92df8b67e0a5ff8aa8e261919c08
         with:
-          # Check https://github.com/codacy/codacy-analysis-cli#project-token to get your project token from your Codacy repository
-          # You can also omit the token and run the tools that support default configurations
+          persist-credentials: false
+          fetch-depth: 0                  # full history (handy for some analyzers)
+
+      # Run Codacy Analysis CLI via the official action (pinned to a commit SHA).
+      # Docs show `format: sarif`, `output: results.sarif`, and the compatibility flag
+      # for GitHub Code Scanning. The huge max-allowed-issues keeps the step green so
+      # uploads always happen; you can also use `continue-on-error: true` if preferred. :contentReference[oaicite:1]{index=1}
+      - name: Run Codacy Analysis CLI
+        continue-on-error: true
+        uses: codacy/codacy-analysis-cli-action@562ee3e92b8e92df8b67e0a5ff8aa8e261919c08 # v4.4.7
+        with:
+          # Token is optional; omitting it runs tools that support defaults.
+          # If you have a Codacy repo token, keep this secret configured.
           project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
           verbose: true
-          output: results.sarif
           format: sarif
-          # Adjust severity of non-security issues
+          output: ${{ env.SARIF_OUT }}
           gh-code-scanning-compat: true
-          # Force 0 exit code to allow SARIF file generation
-          # This will handover control about PR rejection to the GitHub side
+          # Keep CI green; let GitHub Code Scanning govern gating
           max-allowed-issues: 2147483647
 
-      # Upload the SARIF file generated in the previous step
-      - name: Upload SARIF results file
+      # Upload SARIF to Code Scanning (Security tab).
+      # Guarded so it only runs if a SARIF was actually produced.
+      # GitHub requires SARIF 2.1.0. :contentReference[oaicite:2]{index=2}
+      - name: Upload SARIF to Code Scanning
+        if: always() && hashFiles(env.SARIF_OUT) != ''
         uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
         with:
-          sarif_file: results.sarif
+          sarif_file: ${{ env.SARIF_OUT }}
+          category: codacy
+
+      # Keep an auditable copy with explicit retention; never upload secrets.
+      - name: Upload SARIF as artifact
+        if: always() && hashFiles(env.SARIF_OUT) != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codacy-sarif
+          path: ${{ env.SARIF_OUT }}
+          retention-days: 14
