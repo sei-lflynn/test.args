@@ -28,7 +28,7 @@ on:
     paths:
       - "**/*"
       - ".github/workflows/snyk.yml"
-  workflow_dispatch: {}                  # manual trigger (useful for testing)
+  # workflow_dispatch: {}                  # manual trigger (useful for testing)
   schedule:
     - cron: "23 5 * * *"                # optional: daily at 05:23 UTC
 
