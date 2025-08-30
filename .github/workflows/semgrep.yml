@@ -111,13 +111,12 @@ jobs:
           #   ${{ runner.os }}-pip-
 
       # Install Semgrep CLI at the pinned version
-      - name: Install Semgrep CLI (pinned)
+      - name: Install Semgrep CLI (hash-locked)
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install "semgrep==${SEMGREP_VERSION}"
-          semgrep --version
+          python -m pip install --no-deps --require-hashes -r semgrep.lock.txt
+          semgrep --version 
 
       # Baseline for PRs so Semgrep can focus on diffs (noise reduction).
       # For pushes, skip baseline.
