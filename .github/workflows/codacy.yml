@@ -1,162 +1,195 @@
-# Codacy Security Scan (hardened, pinned, least-privilege)
+# Codacy Security Scan → split SARIF runs (hardened, pinned, least-privilege)
 # =============================================================================
-# What this workflow does (in order):
-#   1) Checks out your repo with read-only permissions and no persisted creds.
-#   2) Runs the Codacy Analysis CLI (via pinned action) to produce SARIF.
-#   3) Uploads SARIF to GitHub Code Scanning; also stores it as an artifact.
-#
-# Why these choices (best practices):
-#   • Default-deny at the workflow level; the job elevates only what it needs.
-#   • Pin every third-party action to a commit SHA for tamper resistance.
-#   • Guard untrusted PRs (use pull_request, not pull_request_target).
-#   • Concurrency cancels superseded runs to avoid CI pile-ups.
-#   • Timeouts cap spend and fail fast.
-#   • Harden network egress (start in audit; later block + allowlist).
-#   • Scoped checkout creds (we do not push from this job).
-#   • Trigger only when it matters (dependency files / code / this workflow).
+# Why split? Codacy SARIF often contains MULTIPLE "runs" (one per analyzer).
+# GitHub Code Scanning now requires: ONE run per upload+category.
+# This workflow:
+#   1) Runs Codacy to produce results.sarif
+#   2) Splits that SARIF into per-run files under reports/
+#   3) Uploads each run with a unique category (codacy-<tool>)
+#   4) Stores the split SARIFs as an artifact (auditable)
 
 name: Codacy Security Scan
 
 on:
-  # Run on PRs that affect code or dependency manifests (adjust patterns to taste)
   pull_request:
     branches: [ "main" ]
     paths:
-      - "**/*.c"            # << add/trim languages you use
-      - "**/*.cc"
-      - "**/*.cpp"
-      - "**/*.cs"
-      - "**/*.go"
-      - "**/*.java"
-      - "**/*.js"
-      - "**/*.jsx"
-      - "**/*.ts"
-      - "**/*.tsx"
-      - "**/*.py"
-      - "**/*.rb"
-      - "**/*.php"
-      - "**/*.swift"
-      - "**/*.kt"
-      - "**/*.kts"
-      - "**/package.json"
-      - "**/package-lock.json"
-      - "**/yarn.lock"
-      - "**/pnpm-lock.yaml"
-      - "**/pom.xml"
-      - "**/build.gradle"
-      - "**/build.gradle.kts"
-      - "**/gradle.lockfile"
-      - "**/go.mod"
-      - "**/go.sum"
-      - "**/requirements*.txt"
-      - "**/Pipfile"
-      - "**/Pipfile.lock"
-      - "**/pyproject.toml"
-      - "**/poetry.lock"
-      - "**/Gemfile"
-      - "**/Gemfile.lock"
-      - "**/composer.json"
-      - "**/composer.lock"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
+      - "**/*"
       - ".github/workflows/codacy.yml"
-
-  # Also run on pushes to main (covers direct commits or fast-forwards)
   push:
     branches: [ "main" ]
     paths:
       - "**/*"
       - ".github/workflows/codacy.yml"
-
-  # Optional weekly run for drift detection (adjust cadence as needed)
   schedule:
     - cron: "16 7 * * 2"
-
-  # Manual trigger for testing
   workflow_dispatch:
 
-# Cancel older in-flight runs for the same ref/PR (saves time & CI minutes)
+# Cancel superseded runs on the same ref/PR
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
-# Default-deny at the workflow level
+# Default-deny at workflow level
 permissions:
   contents: read
 
 jobs:
-  codacy-security-scan:
-    name: Codacy Security Scan → SARIF
-    runs-on: ubuntu-24.04               # Explicit runner for reproducibility
-    timeout-minutes: 20                  # Cap total runtime
-
-    # Job-scoped least privilege:
-    # - contents: read         → checkout
-    # - security-events: write → upload SARIF to Code Scanning
-    # - actions: read          → required in private repos for upload-sarif status
+  # Job 1: scan + split
+  codacy-scan:
+    name: Codacy scan and split SARIF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
-      contents: read
-      security-events: write
-      actions: read
+      contents: read           # checkout
+      actions: read            # not strictly needed here; included for parity
+    outputs:
+      sarif_files: ${{ steps.split.outputs.sarif_files }}   # JSON array of {file,category}
 
     env:
-      SARIF_OUT: results.sarif          # single source-of-truth for output path
+      SARIF_OUT: results.sarif
 
     steps:
-      # Harden the ephemeral runner's egress. Start in audit mode to learn endpoints.
-      # When stable, switch to:
-      #   egress-policy: block
-      #   allowed-endpoints: >
-      #     api.github.com:443
-      #     uploads.github.com:443
-      #     objects.githubusercontent.com:443
-      #     github.com:443
-      #     ghcr.io:443         # if the action pulls images from GitHub Container Registry
+      # Harden network egress. Start with audit; later flip to block + allowlist.
       - name: Harden runner (egress audit)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
 
-      # Checkout with no persisted credentials (we’re not pushing)
+      # Checkout with no persisted creds (we don’t push in this job)
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          fetch-depth: 0                  # full history (handy for some analyzers)
+          fetch-depth: 0
 
-      # Run Codacy Analysis CLI via the official action (pinned to a commit SHA).
-      # Docs show `format: sarif`, `output: results.sarif`, and the compatibility flag
-      # for GitHub Code Scanning. The huge max-allowed-issues keeps the step green so
-      # uploads always happen; you can also use `continue-on-error: true` if preferred. :contentReference[oaicite:1]{index=1}
+      # Run Codacy Analysis CLI (pinned action). Keep step green so we can always split+upload.
       - name: Run Codacy Analysis CLI
         continue-on-error: true
         uses: codacy/codacy-analysis-cli-action@562ee3e92b8e92df8b67e0a5ff8aa8e261919c08 # v4.4.7
         with:
-          # Token is optional; omitting it runs tools that support defaults.
-          # If you have a Codacy repo token, keep this secret configured.
-          project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
+          project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}   # optional
           verbose: true
           format: sarif
           output: ${{ env.SARIF_OUT }}
           gh-code-scanning-compat: true
-          # Keep CI green; let GitHub Code Scanning govern gating
           max-allowed-issues: 2147483647
 
-      # Upload SARIF to Code Scanning (Security tab).
-      # Guarded so it only runs if a SARIF was actually produced.
-      # GitHub requires SARIF 2.1.0. :contentReference[oaicite:2]{index=2}
-      - name: Upload SARIF to Code Scanning
-        if: always() && hashFiles(env.SARIF_OUT) != ''
-        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
-        with:
-          sarif_file: ${{ env.SARIF_OUT }}
-          category: codacy
+      # Split MULTI-run SARIF → multiple SINGLE-run SARIFs under ./reports
+      - name: Split SARIF into single-run files
+        id: split
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          if [[ ! -s "${SARIF_OUT}" ]]; then
+            echo "sarif_files=[]" >> "$GITHUB_OUTPUT"
+            echo "No SARIF produced; nothing to split."
+            exit 0
+          fi
+          python - <<'PY'
+          import json, os, pathlib, re
+          sarif_path = os.environ.get("SARIF_OUT", "results.sarif")
+          out_dir = "reports"
+          pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+          with open(sarif_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-      # Keep an auditable copy with explicit retention; never upload secrets.
-      - name: Upload SARIF as artifact
-        if: always() && hashFiles(env.SARIF_OUT) != ''
+          runs = data.get("runs", [])
+          files = []
+          if not runs:
+            pass
+          for idx, run in enumerate(runs, 1):
+            tool = (run.get("tool", {}) or {}).get("driver", {}) or {}
+            name = tool.get("name") or f"run{idx}"
+            # slugify tool name → category-safe
+            slug = re.sub(r"[^a-zA-Z0-9._-]+","-", name).strip("-").lower() or f"run{idx}"
+            out = {
+              "version": data.get("version", "2.1.0"),
+              "$schema": data.get("$schema", "https://json.schemastore.org/sarif-2.1.0.json"),
+              "runs": [run]
+            }
+            fname = f"codacy-{slug}.sarif"
+            fpath = os.path.join(out_dir, fname)
+            with open(fpath, "w", encoding="utf-8") as wf:
+              json.dump(out, wf, ensure_ascii=False)
+            files.append({"file": fpath, "category": f"codacy-{slug}"})
+          # Emit JSON array to step output
+          # GitHub requires single-line JSON
+          print("::set-output name=sarif_files::" + json.dumps(files))
+          PY
+        # GitHub deprecated ::set-output in favor of $GITHUB_OUTPUT, but we used it from Python for simplicity.
+        # Add a quick shim to rewrite the last line to $GITHUB_OUTPUT:
+        continue-on-error: false
+
+      # Shim: Convert the ::set-output line to $GITHUB_OUTPUT (works around Python stdout).
+      - name: Normalize step outputs
+        if: always()
+        shell: bash
+        id: normalize
+        run: |
+          # Extract the last '::set-output name=sarif_files::...' from the previous step's log
+          # and write it to $GITHUB_OUTPUT. If none found, default to [].
+          set -euo pipefail
+          OUT="[]"
+          LOG="${{ github.workspace }}/_tmp_split_log.txt"
+          # Download previous step's log is not trivial; instead re-open the files list directly:
+          if compgen -G "reports/*.sarif" > /dev/null; then
+            files=()
+            for p in reports/*.sarif; do
+              base="$(basename "$p")"
+              cat="$base"
+              files+=("{\"file\":\"reports/$base\",\"category\":\"${base%.sarif}\"}")
+            done
+            printf 'sarif_files=%s\n' "$(printf '[%s]\n' "$(IFS=,; echo "${files[*]}")")" >> "$GITHUB_OUTPUT"
+          else
+            printf 'sarif_files=[]\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      # Upload the split SARIFs as an artifact so the next job can download them
+      - name: Upload split SARIFs as artifact
+        if: always() && hashFiles('reports/*.sarif') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: codacy-sarif
-          path: ${{ env.SARIF_OUT }}
+          name: codacy-sarif-split
+          path: reports/*.sarif
           retention-days: 14
+
+      # Propagate normalized output to the job
+      - name: Export normalized output
+        id: export
+        run: echo "sarif_files=${{ steps.normalize.outputs.sarif_files }}" >> "$GITHUB_OUTPUT"
+
+  # Job 2: upload each single-run SARIF via matrix
+  upload-to-code-scanning:
+    name: Upload split SARIFs to Code Scanning
+    needs: codacy-scan
+    if: ${{ needs.codacy-scan.outputs.sarif_files != '' && needs.codacy-scan.outputs.sarif_files != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write       # only this job uploads SARIF
+      actions: read                # private repos need this for upload action
+    strategy:
+      fail-fast: false
+      matrix:
+        sarif: ${{ fromJson(needs.codacy-scan.outputs.sarif_files) }}
+
+    steps:
+      - name: Harden runner (egress audit)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      - name: Download split SARIFs
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: codacy-sarif-split
+          path: reports
+
+      - name: Upload SARIF (single run)
+        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
+        with:
+          sarif_file: ${{ matrix.sarif.file }}
+          category: ${{ matrix.sarif.category }}
