@@ -1,156 +1,82 @@
 name: OSV-Scanner
 
 on:
+  workflow_dispatch:
   pull_request:
-    branches: [ "main" ]
-    paths:
-      - "**/package.json"
-      - "**/package-lock.json"
-      - "**/pnpm-lock.yaml"
-      - "**/yarn.lock"
-      - "**/requirements*.txt"
-      - "**/pyproject.toml"
-      - "**/poetry.lock"
-      - "**/Pipfile.lock"
-      - "**/go.mod"
-      - "**/go.sum"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - "**/pom.xml"
-      - "**/build.gradle*"
-      - "**/Gemfile.lock"
-      - "**/composer.lock"
-      - "**/mix.lock"
-      - "**/*.csproj"
-      - "**/*.fsproj"
-      - ".github/workflows/osv-scanner.yml"
-  merge_group:
-    branches: [ "main" ]
   push:
-    branches: [ "main" ]
   schedule:
-    - cron: "18 6 * * 1"
-  workflow_dispatch: {}
+    - cron: "18 6 * * 1" # Mondays 06:18 UTC
+
+# Default-deny. Elevate only where needed in the job.
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
-  osv-scan:
-    name: OSV scan → SARIF
+  osv:
+    name: OSV full scan + SARIF upload
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
-      contents: read
+      contents: read                  # checkout
+      security-events: write          # upload SARIF
+      actions: read                   # helps upload in private repos
+
     env:
-      # Pin on purpose. If this tag doesn’t exist later, bump it intentionally.
-      OSV_VERSION: "v1.7.3"
-      SARIF_OUT: "reports/osv.sarif"
+      OSV_VERSION: v2.2.2             # pin OSV-Scanner version (v2 CLI)
+      SARIF_OUT: reports/osv.sarif
+
     steps:
-      - name: Harden runner (egress audit)
+      # Harden egress; start in audit mode (flip to block + allowlist later).
+      - name: Harden the runner (audit egress)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
-      - name: Checkout repository
+
+      # Minimal, read-only checkout; no token persisted.
+      - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          persist-credentials: false
           fetch-depth: 0
-      - name: Prepare reports directory
-        run: mkdir -p reports
+          persist-credentials: false
 
-      # Robust installer: query the release by tag, select the correct asset for linux/amd64,
-      # then download that exact URL. Falls back between "vX.Y.Z" and "X.Y.Z" tags.
-      - name: Install OSV-Scanner (pinned via tag; asset resolved via API)
-        shell: bash
+      # Install Go (pinned) so we can `go install` OSV-Scanner v2 reliably.
+      - name: Setup Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.23.x"
+          check-latest: false
+
+      # Install pinned OSV-Scanner v2 into ~/go/bin and add to PATH.
+      - name: Install OSV-Scanner
         run: |
-          set -euo pipefail
-          req_tag="${OSV_VERSION}"
-          alt_tag="${OSV_VERSION#v}"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          go install github.com/google/osv-scanner/v2/cmd/osv-scanner@${OSV_VERSION}
+          osv-scanner --version
 
-          # Helper to resolve the asset download URL for a given tag
-          resolve_asset_url() {
-            local tag="$1"
-            # Query the release; extract asset URLs; pick linux+amd64 tarballs (common patterns)
-            curl -fsSL "https://api.github.com/repos/google/osv-scanner/releases/tags/${tag}" \
-            | jq -r '.assets[].browser_download_url' \
-            | grep -E 'linux.*(amd64|x86_64).*\.(tar\.gz|tgz)$' \
-            | head -n1 || true
-          }
-
-          url="$(resolve_asset_url "${req_tag}")"
-          if [[ -z "${url}" ]]; then
-            url="$(resolve_asset_url "${alt_tag}")"
-          fi
-
-          if [[ -z "${url}" ]]; then
-            echo "Could not locate a linux/amd64 tarball for tag '${OSV_VERSION}'. Consider bumping OSV_VERSION." >&2
-            exit 1
-          fi
-
-          echo "Downloading: ${url}"
-          tmpdir="$(mktemp -d)"
-          cd "${tmpdir}"
-          curl -fsSL -o osv.tar.gz "${url}"
-          tar -xzf osv.tar.gz
-
-          # Find the extracted binary (name may vary across releases)
-          bin_path="$(find . -maxdepth 2 -type f -name 'osv-scanner' | head -n1 || true)"
-          if [[ -z "${bin_path}" ]]; then
-            echo "osv-scanner binary not found in archive." >&2
-            exit 1
-          fi
-
-          sudo mv "${bin_path}" /usr/local/bin/osv-scanner
-          sudo chmod +x /usr/local/bin/osv-scanner
-          /usr/local/bin/osv-scanner --version
-
-      - name: Run OSV-Scanner → SARIF
-        shell: bash
+      # Run a recursive scan of the repo (skip .git); emit SARIF for Code Scanning.
+      # continue-on-error lets us still upload SARIF even if vulnerabilities are found.
+      - name: Run OSV-Scanner (v2) → SARIF
+        continue-on-error: true
         run: |
-          set -euo pipefail
-          /usr/local/bin/osv-scanner \
-            -r \
-            --skip-git \
-            ./ \
-            --format sarif \
-            --output "${SARIF_OUT}" \
-          || true
-          test -s "${SARIF_OUT}" || (echo "No SARIF produced" >&2; exit 1)
+          mkdir -p "$(dirname "${SARIF_OUT}")"
+          osv-scanner scan -r --skip-git ./ --format sarif --output "${SARIF_OUT}"
 
-      - name: Upload SARIF artifact
+      # Upload SARIF to the Security tab
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
+        with:
+          sarif_file: ${{ env.SARIF_OUT }}
+
+      # Optional: also keep the SARIF as an artifact for auditing.
+      - name: Upload SARIF artifact (optional)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: osv-sarif
+          name: osv-scanner-sarif
           path: ${{ env.SARIF_OUT }}
-          retention-days: 14
-
-  upload-sarif:
-    name: Upload OSV SARIF to Code Scanning
-    needs: osv-scan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
-    steps:
-      - name: Harden runner (egress audit)
-        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
-        with:
-          egress-policy: audit
-      - name: Download SARIF artifact
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        with:
-          name: osv-sarif
-          path: reports
-      - name: Upload SARIF to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
-        with:
-          sarif_file: reports/osv.sarif
-          category: osv-scanner
+          retention-days: 7
