@@ -1,3 +1,4 @@
+=======
 # Gitleaks secret scanning (native SARIF) with hardening and best practices
 # =============================================================================
 # What this workflow does (in order):
@@ -25,17 +26,16 @@ on:
     - cron: "0 4 * * *"   # daily at 04:00 UTC
   workflow_dispatch:
 
-# Cancel older in-flight runs for the same ref/PR (prevents CI pile-ups)
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
-# Default-deny: the workflow as a whole has read-only access.
 permissions:
   contents: read
 
 jobs:
   scan:
+
     name: Gitleaks scan → Code Scanning
     runs-on: ubuntu-24.04                 # Pin runner for reproducibility
     timeout-minutes: 20                   # Upper bound for this job
@@ -44,7 +44,8 @@ jobs:
     # - contents: read         → required for checkout
     # - security-events: write → required to upload SARIF to Code Scanning
     # - actions: read          → required in private repos so upload-sarif can read run status
-    permissions:
+
+  permissions:
       contents: read
       security-events: write
       actions: read
