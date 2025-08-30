@@ -44,7 +44,7 @@ jobs:
     # - security-events: write → required to upload SARIF to Code Scanning
     # - actions: read          → required in private repos so upload-sarif can read run status
 
-  permissions:
+    permissions:
       contents: read
       security-events: write
       actions: read
