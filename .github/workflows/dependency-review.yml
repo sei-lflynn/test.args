@@ -160,9 +160,11 @@ jobs:
       - name: Determine base ref for push
         id: base
         shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}   # previous commit SHA on push events
         run: |
           set -euo pipefail
-          BEFORE="${GITHUB_EVENT_BEFORE:-}"
+          BEFORE="${BEFORE:-}"
           if [[ -n "$BEFORE" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
             echo "base=$BEFORE" >> "$GITHUB_OUTPUT"
           else
@@ -171,7 +173,7 @@ jobs:
             else
               # empty tree object (treats all files as additions)
               echo "base=4b825dc642cb6eb9a060e54bf8d69288fbee4904" >> "$GITHUB_OUTPUT"
-            end
+            fi
           fi
           echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
