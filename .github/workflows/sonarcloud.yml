@@ -32,18 +32,18 @@ on:
   push:
     branches: [ "main" ]
     # Trigger only when C sources, the workflow, or Sonar properties change
-    paths:
-      - '**/*.c'
-      - 'sonar-project.properties'
-      - '.github/workflows/sonarcloud.yml'
+    # paths:
+    #  - '**/*.c'
+    #  - 'sonar-project.properties'
+    #  - '.github/workflows/sonarcloud.yml'
   pull_request:
     branches: [ "main" ]
     types: [opened, synchronize, reopened]
-    paths:
-      - '**/*.c'
-      - 'sonar-project.properties'
-      - '.github/workflows/sonarcloud.yml'
-  workflow_dispatch:
+    # paths:
+    #  - '**/*.c'
+    #  - 'sonar-project.properties'
+    #  - '.github/workflows/sonarcloud.yml'
+  # workflow_dispatch:
 
 # Cancel older in‑flight runs of the same ref. Avoids CI pile‑ups on active PRs.
 concurrency:
