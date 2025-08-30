@@ -48,21 +48,21 @@ jobs:
       contents: read
     env:
       OSV_VERSION: v2.2.2
-      SARIF_OUT: reports/osv.sarif
+      SARIF_OUT: osv.sarif     # write to workspace root so no mkdir needed
     steps:
       - name: Harden runner (egress audit)
-        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
           fetch-depth: 0
 
       - name: Setup Go (pinned)
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version: "1.23.x"
 
@@ -75,12 +75,13 @@ jobs:
       - name: Run OSV-Scanner → SARIF
         continue-on-error: true
         run: |
-          mkdir -p "$(dirname "${SARIF_OUT}")"
-          osv-scanner scan -r --skip-git ./ --format sarif --output "${SARIF_OUT}"
+          # v2 syntax: 'scan'; do not use '--skip-git'
+          osv-scanner scan -r ./ --format sarif --output "${SARIF_OUT}"
+          test -s "${SARIF_OUT}" || (echo "No SARIF produced" >&2; exit 1)
 
       - name: Upload SARIF artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: osv-sarif
           path: ${{ env.SARIF_OUT }}
@@ -97,18 +98,18 @@ jobs:
       actions: read
     steps:
       - name: Harden runner (egress audit)
-        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
 
       - name: Download SARIF artifact
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: osv-sarif
-          path: reports
+          path: .
 
       - name: Upload SARIF to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498
+        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
         with:
-          sarif_file: reports/osv.sarif
+          sarif_file: osv.sarif
           category: osv-scanner
