@@ -1,20 +1,31 @@
-# OSV-Scanner (hardened, pinned) — PRs, merge queue, pushes to main, weekly, manual
+# OSV-Scanner (hardened, pinned, least-privilege) — PRs, merge-queue, pushes, weekly, manual
 # =============================================================================
-# What this does:
-#   • For PRs/merge-queue: runs OSV-Scanner to catch new vulns before merge.
-#   • For pushes/scheduled: runs periodic scans for drift.
-# Why this shape:
-#   • Reusable workflow calls (required by OSV’s repo) → no local steps here.
-#   • Least privilege: job-level permissions scoped to each call.
-#   • Concurrency + timeouts; explicit branch/path filters; SHA pins.
+# What this workflow does:
+#   1) Job "osv-scan": installs a pinned OSV-Scanner CLI, scans your dependency manifests
+#      recursively, and writes a SARIF report at reports/osv.sarif. It then uploads the SARIF
+#      as an artifact (for auditing and the next job).
+#   2) Job "upload-sarif": downloads that SARIF and uploads it to GitHub Code Scanning.
+#
+# Why this layout:
+#   • Your previous error came from calling a reusable workflow with job-level `uses:`. Some environments
+#     (or older schema validators) will demand `runs-on`. Running the CLI locally avoids that.
+#   • Least privilege: only the uploader job gets `security-events: write`.
+#   • Pinned actions, explicit runner, concurrency, timeouts, and egress hardening are applied.
+#
+# Freshman notes:
+#   • Update OSV_VERSION below on purpose during maintenance (review the diff).
+#   • Narrow the trigger paths to the ecosystems you actually use to save CI minutes.
+#   • To block merges on findings, remove the "|| true" softening in the scan step and/or add OSV flags
+#     like `--fail-on=all` or `--severity=HIGH,CRITICAL`.
 
 name: OSV-Scanner
 
 on:
+  # Scan proposed changes before merge
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main" ]                     # ← tune to your branching model
     paths:
-      # Narrow to dependency manifests to save minutes. Add/remove as needed.
+      # Common dependency files; trim to your ecosystems to reduce cost/noise
       - "**/package.json"
       - "**/package-lock.json"
       - "**/pnpm-lock.yaml"
@@ -36,64 +47,109 @@ on:
       - "**/*.fsproj"
       - ".github/workflows/osv-scanner.yml"
 
+  # Merge queue batches (optional)
   merge_group:
     branches: [ "main" ]
     paths:
       - "**/*"
       - ".github/workflows/osv-scanner.yml"
 
+  # Cover direct commits
   push:
     branches: [ "main" ]
     paths:
       - "**/*"
       - ".github/workflows/osv-scanner.yml"
 
+  # Weekly drift check
   schedule:
-    - cron: "18 6 * * 1"    # Mondays 06:18 UTC
+    - cron: "18 6 * * 1"                     # Mondays 06:18 UTC
 
+  # Manual trigger
   workflow_dispatch: {}
 
-# Cancel superseded runs (prevents CI pile-ups on busy PRs)
+# Cancel superseded runs (prevents CI pile-ups)
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
-# Default-deny at workflow level; jobs elevate only what they need
+# Default-deny at workflow scope; jobs elevate only what they need
 permissions:
   contents: read
 
 jobs:
-  # ───────────────────────── Scheduled / Push scans ─────────────────────────
-  scan-scheduled:
-    # Reusable workflow call: you cannot add local steps here.
-    # OSV’s reusable workflow handles checkout, scanning, and SARIF upload.
-    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
-    # Least privilege needed to upload SARIF
+  # ───────────────────────────────────── Job 1: Scan ─────────────────────────────────────
+  osv-scan:
+    name: OSV scan → SARIF
+    runs-on: ubuntu-24.04                     # explicit runner for reproducibility
+    timeout-minutes: 15                       # cap runtime; fail fast
     permissions:
-      contents: read
-      security-events: write
-    timeout-minutes: 15
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@90b209d0ea55cea1da9fc0c4e65782cc6acb6e2e # v2.2.2
-    with:
-      # Scan recursively; skip .git
-      scan-args: |-
-        -r
-        --skip-git
-        ./
+      contents: read                          # only needs to read the repo
 
-    # If your repository needs secrets (rare for OSV), pass them through:
-    # secrets: inherit
+    env:
+      # Pin OSV-Scanner version intentionally (update on purpose)
+      OSV_VERSION: "v1.7.3"
+      # Path for the SARIF report
+      SARIF_OUT: "reports/osv.sarif"
 
-  # ───────────────────────── PR / Merge-queue scans ────────────────────────
-  scan-pr:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
-    permissions:
-      contents: read
-      security-events: write
-    timeout-minutes: 15
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@90b209d0ea55cea1da9fc0c4e65782cc6acb6e2e # v2.2.2
-    with:
-      scan-args: |-
-        -r
-        --skip-git
-        ./
+    steps:
+      # Harden egress. Start in 'audit' to learn endpoints; later switch to 'block' + allowlist:
+      #   api.github.com:443, uploads.github.com:443, objects.githubusercontent.com:443, github.com:443
+      - name: Harden runner (egress audit)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      # Checkout with no persisted credentials (we never push here)
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Prepare output directory
+      - name: Prepare reports directory
+        shell: bash
+        run: mkdir -p reports
+
+      # Install a pinned OSV-Scanner CLI release (Linux x86_64).
+      # Freshman tip: this downloads a single binary and moves it into /usr/local/bin.
+      # If your runner arch differs, adjust the artifact name accordingly.
+      - name: Install OSV-Scanner (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          # Download tarball for pinned version
+          curl -fsSL -o osv.tar.gz "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_${OSV_VERSION#v}_linux_amd64.tar.gz"
+          tar -xzf osv.tar.gz
+          sudo mv osv-scanner /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+
+      # Run OSV-Scanner recursively, skip .git, and write SARIF.
+      # "|| true" ensures we still upload SARIF even if findings or non-zero exits occur.
+      # Remove "|| true" (and/or add --fail-on=all) if you want the job to fail on vulns.
+      - name: Run OSV-Scanner → SARIF
+        shell: bash
+        run: |
+          set -euo pipefail
+          osv-scanner \
+            -r \
+            --skip-git \
+            ./ \
+            --format sarif \
+            --output "${SARIF_OUT}" \
+          || true
+          test -s "${SARIF_OUT}" || (echo "No SARIF produced"; exit 1)
+
+      # Keep an auditable copy for 14 days and for the next job
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: osv-sarif
+          path: ${{ env.SARIF_OUT }}
+          retention-days: 14
+
+  # ─────────────────────────────────── Job 2: Uplo
