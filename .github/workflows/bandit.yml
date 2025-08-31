@@ -145,7 +145,7 @@ jobs:
         with:
           python-version: "3.12.5"
 
-      - name: Install Bandit (ephemeral hash-lock; no network at install)
+      - name: Install Bandit (ephemeral hash-lock; fixed)
         shell: bash
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -154,17 +154,19 @@ jobs:
         run: |
           set -euo pipefail
           tmp="$(mktemp -d)"
-          # Resolve exact artifacts and capture their hashes
+          # 1) Download exact artifacts for this env (wheels preferred)
           python -m pip download --only-binary=:all: -d "$tmp" "bandit[sarif,toml]==${BANDIT_VERSION}"
-          req="$tmp/requirements.txt"; : > "$req"
+          # 2) Build a lock file from artifacts ONLY (never include the lock itself)
+          lock="$tmp/lock.txt"; : > "$lock"
           while IFS= read -r f; do
-            h="$(sha256sum "$tmp/$f" | awk '{print $1}')"
-            printf 'file://%s --hash=sha256:%s\n' "$tmp/$f" "$h" >> "$req"
-          done < <(ls -1 "$tmp" | sort)
-          # Install strictly from the local wheel set, verifying hashes
-          python -m pip install --no-index --require-hashes -r "$req"
+            h="$(sha256sum "$f" | awk '{print $1}')"
+            printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$lock"
+          done < <(find "$tmp" -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) | sort)
+          # 3) Offline, hash-verified install
+          python -m pip install --no-index --require-hashes -r "$lock"
           bandit --version
         timeout-minutes: 5
+
 
       # Run Bandit with native SARIF output.
       # --exit-zero keeps CI green; remove it to enforce gating (failing on findings).
