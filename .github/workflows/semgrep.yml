@@ -99,7 +99,7 @@ jobs:
         with:
           python-version: "3.12.5"
 
-      - name: Install Semgrep CLI (ephemeral hash-lock; sdist-safe)
+      - name: Install Semgrep CLI (hash-locked; sdist-safe, two-phase)
         shell: bash
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -107,30 +107,41 @@ jobs:
         run: |
           set -euo pipefail
           tmp="$(mktemp -d)"
-          # 1) Resolve exact artifacts for Semgrep and deps; also fetch build deps for sdists.
+
+          # 1) Resolve exact artifacts (Semgrep + build tools). Downloads all deps.
           python -m pip download -d "$tmp" "semgrep==${SEMGREP_VERSION}" "setuptools" "wheel"
-          # 2) Build a lock file from artifacts ONLY (hash every file).
-          lock="$tmp/lock.txt"; : > "$lock"
-          # Put build tools first so sdists can build without network.
+
+          # 2) Create two lock files: build tools first, then everything else.
+          build="$tmp/build-req.txt"; : > "$build"
+          main="$tmp/main-req.txt";  : > "$main"
+
+          # Lock setuptools and wheel so sdists can build offline.
           for n in setuptools wheel; do
             f="$(ls -1 "$tmp"/$n-*.whl 2>/dev/null | sort | tail -n1 || true)"
             if [ -n "$f" ]; then
               h="$(sha256sum "$f" | awk '{print $1}')"
-              printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$lock"
+              printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$build"
             fi
           done
-          # Hash the rest (wheels and sdists).
+
+          # Lock all remaining artifacts (wheels + sdists). Exclude the build wheels above.
           while IFS= read -r f; do
             base="$(basename "$f")"
             case "$base" in setuptools-*.whl|wheel-*.whl) continue;; esac
             h="$(sha256sum "$f" | awk '{print $1}')"
-            printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$lock"
+            printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$main"
           done < <(find "$tmp" -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) | sort)
-          # 3) Offline, hash-verified install. No build isolation → uses local setuptools/wheel.
-          python -m pip install --no-index --require-hashes --no-build-isolation -r "$lock"
+
+          # 3) Install build tooling first (offline, hash-verified).
+          if [ -s "$build" ]; then
+            python -m pip install --no-index --require-hashes -r "$build"
+          fi
+
+          # 4) Install the rest offline; no build isolation so sdists use the local setuptools/wheel.
+          python -m pip install --no-index --require-hashes --no-build-isolation -r "$main"
+
           semgrep --version
         timeout-minutes: 10
-
 
       # Baseline for PRs so Semgrep can focus on diffs (noise reduction).
       # For pushes, skip baseline.
