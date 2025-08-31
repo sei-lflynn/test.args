@@ -140,22 +140,31 @@ jobs:
           cache-dependency-path: ${{ steps.deps.outputs.paths }}
 
       # Fallback: plain Python setup (no cache).
-      - name: Set up Python (no cache)
-        if: ${{ steps.deps.outputs.have_deps != 'true' }}
+      - name: Set up Python (exact patch)
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.5"
 
-      # Install Bandit with SARIF formatter support (bandit[sarif]); add [toml]
-      # if you configure Bandit in pyproject.toml. Pinned version for reproducibility.
-      - name: Install Bandit (pinned, SARIF-enabled)
+      - name: Install Bandit (ephemeral hash-lock; no network at install)
         shell: bash
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_INDEX_URL: "https://pypi.org/simple"
+          BANDIT_VERSION: "1.8.6"
         run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install "bandit[sarif,toml]==${BANDIT_VERSION}"
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          # Resolve exact artifacts and capture their hashes
+          python -m pip download --only-binary=:all: -d "$tmp" "bandit[sarif,toml]==${BANDIT_VERSION}"
+          req="$tmp/requirements.txt"; : > "$req"
+          while IFS= read -r f; do
+            h="$(sha256sum "$tmp/$f" | awk '{print $1}')"
+            printf 'file://%s --hash=sha256:%s\n' "$tmp/$f" "$h" >> "$req"
+          done < <(ls -1 "$tmp" | sort)
+          # Install strictly from the local wheel set, verifying hashes
+          python -m pip install --no-index --require-hashes -r "$req"
           bandit --version
-        timeout-minutes: 3
+        timeout-minutes: 5
 
       # Run Bandit with native SARIF output.
       # --exit-zero keeps CI green; remove it to enforce gating (failing on findings).
