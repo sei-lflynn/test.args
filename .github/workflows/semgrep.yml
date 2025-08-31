@@ -94,10 +94,10 @@ jobs:
           fetch-depth: 0                  # full history; useful if rules look at blame/history
 
       # Set up Python (pinned) so we can install a specific Semgrep version
-      - name: Set up Python
+      - name: Set up Python (exact patch)
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.5"
 
       # Cache pip downloads to speed future runs (safe, version-keyed)
       - name: Cache pip
@@ -111,12 +111,27 @@ jobs:
           #   ${{ runner.os }}-pip-
 
       # Install Semgrep CLI at the pinned version
-      - name: Install Semgrep CLI (hash-locked)
+      - name: Install Semgrep CLI (ephemeral hash-lock; fixed)
         shell: bash
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_INDEX_URL: "https://pypi.org/simple"
         run: |
           set -euo pipefail
-          python -m pip install --no-deps --require-hashes -r semgrep.lock.txt
-          semgrep --version 
+          tmp="$(mktemp -d)"
+          # 1) Download exact artifacts for this env (prefer wheels)
+          python -m pip download --only-binary=:all: -d "$tmp" "semgrep==${SEMGREP_VERSION}"
+          # 2) Build a lock file from artifacts ONLY (never include the lock itself)
+          lock="$tmp/lock.txt"; : > "$lock"
+          while IFS= read -r f; do
+            h="$(sha256sum "$f" | awk '{print $1}')"
+            printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$lock"
+          done < <(find "$tmp" -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) | sort)
+          # 3) Offline, hash-verified install
+          python -m pip install --no-index --require-hashes -r "$lock"
+          semgrep --version
+        timeout-minutes: 5
+
 
       # Baseline for PRs so Semgrep can focus on diffs (noise reduction).
       # For pushes, skip baseline.
