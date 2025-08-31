@@ -99,19 +99,7 @@ jobs:
         with:
           python-version: "3.12.5"
 
-      # Cache pip downloads to speed future runs (safe, version-keyed)
-      - name: Cache pip
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-semgrep-${{ env.SEMGREP_VERSION }}
-          # Optional fallback if you bump SEMGREP_VERSION frequently:
-          # restore-keys: |
-          #   ${{ runner.os }}-pip-semgrep-
-          #   ${{ runner.os }}-pip-
-
-      # Install Semgrep CLI at the pinned version
-      - name: Install Semgrep CLI (ephemeral hash-lock; fixed)
+      - name: Install Semgrep CLI (ephemeral hash-lock; sdist-safe)
         shell: bash
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -119,18 +107,29 @@ jobs:
         run: |
           set -euo pipefail
           tmp="$(mktemp -d)"
-          # 1) Download exact artifacts for this env (prefer wheels)
-          python -m pip download --only-binary=:all: -d "$tmp" "semgrep==${SEMGREP_VERSION}"
-          # 2) Build a lock file from artifacts ONLY (never include the lock itself)
+          # 1) Resolve exact artifacts for Semgrep and deps; also fetch build deps for sdists.
+          python -m pip download -d "$tmp" "semgrep==${SEMGREP_VERSION}" "setuptools" "wheel"
+          # 2) Build a lock file from artifacts ONLY (hash every file).
           lock="$tmp/lock.txt"; : > "$lock"
+          # Put build tools first so sdists can build without network.
+          for n in setuptools wheel; do
+            f="$(ls -1 "$tmp"/$n-*.whl 2>/dev/null | sort | tail -n1 || true)"
+            if [ -n "$f" ]; then
+              h="$(sha256sum "$f" | awk '{print $1}')"
+              printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$lock"
+            fi
+          done
+          # Hash the rest (wheels and sdists).
           while IFS= read -r f; do
+            base="$(basename "$f")"
+            case "$base" in setuptools-*.whl|wheel-*.whl) continue;; esac
             h="$(sha256sum "$f" | awk '{print $1}')"
             printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$lock"
           done < <(find "$tmp" -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) | sort)
-          # 3) Offline, hash-verified install
-          python -m pip install --no-index --require-hashes -r "$lock"
+          # 3) Offline, hash-verified install. No build isolation → uses local setuptools/wheel.
+          python -m pip install --no-index --require-hashes --no-build-isolation -r "$lock"
           semgrep --version
-        timeout-minutes: 5
+        timeout-minutes: 10
 
 
       # Baseline for PRs so Semgrep can focus on diffs (noise reduction).
