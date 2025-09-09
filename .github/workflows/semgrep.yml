@@ -207,61 +207,6 @@ jobs:
           retention-days: 14
 
 
-
-      - name: Add CWE tags to SARIF (for GitHub filters/UI)
-        run: |
-          python - << 'PY'
-          import json, re, sys, pathlib
-          p = pathlib.Path("semgrep.sarif")
-          data = json.loads(p.read_text())
-
-          # Collect CWEs per result (prefer Semgrep rule metadata if present)
-          # and/or infer from Juliet filenames (e.g., CWE121_...).
-          def to_tag(cwe):
-            # accept "CWE-79", "79", "cwe079" -> external/cwe/cwe-079
-            n = re.sub(r"\D", "", str(cwe))[:4]
-            return f"external/cwe/cwe-{int(n):03d}" if n else None
-
-          # Map ruleId -> set(cwe tags) discovered in results/paths
-          rule_to_tags = {}
-          for run in data.get("runs", []):
-            for res in run.get("results", []):
-              rid = res.get("ruleId")
-              tags = set()
-              # from Semgrep metadata embedded in result?
-              meta = (res.get("properties", {}) or {}).get("metadata", {})
-              for k in ("cwe", "cwes"):  # handle list or single
-                v = meta.get(k)
-                if isinstance(v, list):
-                  tags.update(filter(None, map(to_tag, v)))
-                elif v:
-                  tags.add(to_tag(v))
-              # fallback: infer from file path (Juliet files encode CWE###)
-              loc = (res.get("locations") or res.get("partialFingerprints") or [])
-              if isinstance(loc, list) and loc:
-                path = loc[0].get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
-                m = re.search(r"CWE-?(\d{1,4})", path, re.I) or re.search(r"\bCWE(\d{1,4})", path, re.I)
-                if m:
-                  tags.add(to_tag(m.group(1)))
-              if rid:
-                rule_to_tags.setdefault(rid, set()).update(t for t in tags if t)
-
-            # Inject tags onto the rule definitions so GitHub can show/filter by CWE
-            rules = run.get("tool", {}).get("driver", {}).get("rules", []) or []
-            for rule in rules:
-              rid = rule.get("id")
-              props = rule.setdefault("properties", {})
-              tags = set(props.get("tags", []))
-              tags.update(rule_to_tags.get(rid, set()))
-              props["tags"] = sorted(t for t in tags if t)
-
-          p.write_text(json.dumps(data, indent=2))
-          print("CWE tags added to semgrep.sarif")
-          PY
-
-
-
-
   # ────────────────────────────────── Job 2: Upload ──────────────────────────────────
   upload-sarif:
     name: Upload SARIF to Code Scanning
