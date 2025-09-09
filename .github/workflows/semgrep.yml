@@ -17,85 +17,54 @@
 name: Semgrep
 
 on:
-  # Manual button in the Actions tab (good for testing)
   workflow_dispatch: {}
-
-  # Scan proposed changes safely (no secrets shared with forks by default)
   pull_request:
-    branches: [ "main" ]                 # tune to your model
+    branches: [ "main" ]
     paths:
-      - "**/*"                           # narrow to your code paths to cut cost if desired
+      - "**/*"
       - ".github/workflows/semgrep.yml"
-
-  # Cover direct commits to main
   push:
     branches: [ "main" ]
     paths:
       - "**/*"
       - ".github/workflows/semgrep.yml"
-
-  # Nightly drift check
   schedule:
-    - cron: "16 6 * * *"                 # daily at 06:16 UTC
+    - cron: "16 6 * * *"
 
-# Cancel older in-flight runs on the same ref/PR (saves minutes; avoids pile-ups)
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
-# Default-deny at the workflow level (read-only). Jobs elevate minimally.
 permissions:
   contents: read
 
 jobs:
-  # ────────────────────────────────── Job 1: Scan ──────────────────────────────────
   semgrep-scan:
     name: Semgrep scan → SARIF
-    runs-on: ubuntu-24.04                   # explicit runner for reproducibility
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
-
-    # Least privilege: only needs to read the repo
     permissions:
       contents: read
-
-    # Central knobs
     env:
-      # If set, enables Semgrep App (org policies, triage, PR comments if configured).
       SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-      # Pin the CLI. Update intentionally and via PR review.
       SEMGREP_VERSION: "1.134.0"
-      # SARIF output path (relative to workspace)
       SARIF_FILE: "semgrep.sarif"
-      # CWE-enriched SARIF path
       SARIF_ENRICHED_FILE: "semgrep.cwe-tagged.sarif"
-
-    # Expose whether SARIF exists so the upload job can decide to run
     outputs:
       has_sarif: ${{ steps.check.outputs.has_sarif }}
 
     steps:
-      # Harden egress. Start with audit to learn endpoints. Later switch to:
-      #   egress-policy: block
-      #   allowed-endpoints: >
-      #     api.github.com:443
-      #     uploads.github.com:443
-      #     objects.githubusercontent.com:443
-      #     github.com:443
-      #     pypi.org:443
-      #     files.pythonhosted.org:443
       - name: Harden runner (egress audit)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
 
-      # Checkout with no persisted credentials (we won’t push from this job)
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          fetch-depth: 0                  # full history; useful if rules look at blame/history
+          fetch-depth: 0
 
-      # Set up Python (pinned) so we can install a specific Semgrep version
       - name: Set up Python (exact patch)
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
@@ -109,15 +78,9 @@ jobs:
         run: |
           set -euo pipefail
           tmp="$(mktemp -d)"
-
-          # 1) Resolve exact artifacts (Semgrep + build tools). Downloads all deps.
           python -m pip download -d "$tmp" "semgrep==${SEMGREP_VERSION}" "setuptools" "wheel"
-
-          # 2) Create two lock files: build tools first, then everything else.
           build="$tmp/build-req.txt"; : > "$build"
           main="$tmp/main-req.txt";  : > "$main"
-
-          # Lock setuptools and wheel so sdists can build offline.
           for n in setuptools wheel; do
             f="$(ls -1 "$tmp"/$n-*.whl 2>/dev/null | sort | tail -n1 || true)"
             if [ -n "$f" ]; then
@@ -125,28 +88,19 @@ jobs:
               printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$build"
             fi
           done
-
-          # Lock all remaining artifacts (wheels + sdists). Exclude the build wheels above.
           while IFS= read -r f; do
             base="$(basename "$f")"
             case "$base" in setuptools-*.whl|wheel-*.whl) continue;; esac
             h="$(sha256sum "$f" | awk '{print $1}')"
             printf 'file://%s --hash=sha256:%s\n' "$f" "$h" >> "$main"
           done < <(find "$tmp" -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) | sort)
-
-          # 3) Install build tooling first (offline, hash-verified).
           if [ -s "$build" ]; then
             python -m pip install --no-index --require-hashes -r "$build"
           fi
-
-          # 4) Install the rest offline; no build isolation so sdists use the local setuptools/wheel.
           python -m pip install --no-index --require-hashes --no-build-isolation -r "$main"
-
           semgrep --version
         timeout-minutes: 10
 
-      # Baseline for PRs so Semgrep can focus on diffs (noise reduction).
-      # For pushes, skip baseline.
       - name: Determine baseline commit (PRs only)
         id: base
         shell: bash
@@ -160,11 +114,7 @@ jobs:
             echo "baseline=" >> "$GITHUB_OUTPUT"
           fi
 
-      # Run Semgrep and write SARIF + JSON (no filename heuristics).
-      # If SEMGREP_APP_TOKEN is set → 'semgrep ci' (uses organization policies).
-      # Else → 'semgrep scan --config p/ci' (curated rules for CI).
-      # By default Semgrep exits 0 even with findings; to gate merges, add `--error`
-      # or configure blocking policies in Semgrep App.
+      # ✅ One format only: SARIF
       - name: Run Semgrep (CI or CE) → SARIF
         shell: bash
         env:
@@ -172,74 +122,52 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${SEMGREP_APP_TOKEN:-}" ]]; then
-            semgrep ci --sarif --output "${SARIF_FILE}" \
-                       --json --json-output "semgrep.json"
+            semgrep ci --sarif --output "${SARIF_FILE}"
           else
-            # semgrep scan --config p/ci --sarif --output "${SARIF_FILE}"
             semgrep scan --config auto \
-            --config p/owasp-top-ten \
-            --config p/cwe-top-25 \
-            --config p/security-audit \
-            --config p/secrets \
-            --timeout=30 \
-            --timeout-threshold=0 \
-            --max-target-bytes=0 \
-            --dataflow-traces \
-            --sarif --output "${SARIF_FILE}" \
-            --json  --json-output "semgrep.json"
+              --config p/owasp-top-ten \
+              --config p/cwe-top-25 \
+              --config p/security-audit \
+              --config p/secrets \
+              --timeout=30 \
+              --timeout-threshold=0 \
+              --max-target-bytes=0 \
+              --dataflow-traces \
+              --sarif --output "${SARIF_FILE}"
           fi
 
-      # NEW: Add CWE tags to SARIF from Semgrep rule metadata ONLY (no path/filename inference)
-      - name: Enrich SARIF with CWE tags (Semgrep metadata only)
+      # ✅ Convert existing SARIF CWE tags to GitHub's taxonomy tags (no filename inference)
+      - name: Enrich SARIF with CWE tags (Semgrep SARIF → external/cwe/cwe-###)
         shell: bash
         run: |
           set -euo pipefail
           python - << 'PY'
-          import json, re
-
-          with open('semgrep.json', 'r', encoding='utf-8') as f:
-              sj = json.load(f)
-          with open('semgrep.sarif', 'r', encoding='utf-8') as f:
+          import json, re, os
+          src = os.environ.get("SARIF_FILE", "semgrep.sarif")
+          dst = os.environ.get("SARIF_ENRICHED_FILE", "semgrep.cwe-tagged.sarif")
+          with open(src, "r", encoding="utf-8") as f:
               sarif = json.load(f)
 
-          # Build rule_id -> set of CWE numbers from Semgrep rule metadata
-          cwe_map = {}
-          for r in sj.get("results", []):
-              rid = r.get("check_id")
-              md = (r.get("extra") or {}).get("metadata") or {}
-              cwe_field = md.get("cwe")
-              if not cwe_field:
-                  continue
-              values = cwe_field if isinstance(cwe_field, list) else [cwe_field]
-              nums = []
-              for v in values:
-                  if isinstance(v, str):
-                      m = re.search(r'CWE-(\d+)', v, flags=re.IGNORECASE)
-                      if m: nums.append(m.group(1))
-              if nums and rid:
-                  cwe_map.setdefault(rid, set()).update(nums)
-
-          # Inject tags onto SARIF rule definitions
           for run in sarif.get("runs", []):
-              driver = (run.get("tool") or {}).get("driver") or {}
-              rules = driver.get("rules") or []
-              for rule in rules:
-                  rid = rule.get("id")
-                  nums = cwe_map.get(rid)
-                  if not nums:
-                      continue
+              tool = (run.get("tool") or {}).get("driver") or {}
+              for rule in tool.get("rules", []) or []:
                   props = rule.setdefault("properties", {})
-                  tags  = set(props.get("tags", []))
-                  for n in sorted(nums):
-                      # GitHub recognizes taxonomy-style CWE tags:
-                      tags.add(f"external/cwe/cwe-{n}")
+                  tags = set(props.get("tags", []))
+                  # Find CWE numbers in existing tags like "CWE-250: ..." or "CWE-079"
+                  cwes = set()
+                  for t in list(tags):
+                      m = re.search(r"\bCWE-?(\d{1,4})\b", t, flags=re.IGNORECASE)
+                      if m:
+                          cwes.add(int(m.group(1)))
+                  # Add GitHub-style taxonomy tags
+                  for n in sorted(cwes):
+                      tags.add(f"external/cwe/cwe-{n:03d}")
                   props["tags"] = sorted(tags)
 
-          with open('semgrep.cwe-tagged.sarif', 'w', encoding='utf-8') as f:
+          with open(dst, "w", encoding="utf-8") as f:
               json.dump(sarif, f, indent=2)
           PY
 
-      # Verify we actually produced an enriched SARIF (guards the upload job)
       - name: Check SARIF exists
         id: check
         shell: bash
@@ -251,7 +179,6 @@ jobs:
             echo "has_sarif=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Keep an auditable copy with defined retention
       - name: Upload SARIF as artifact
         if: always() && steps.check.outputs.has_sarif == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -260,36 +187,29 @@ jobs:
           path: ${{ env.SARIF_ENRICHED_FILE }}
           retention-days: 14
 
-
-  # ────────────────────────────────── Job 2: Upload ──────────────────────────────────
   upload-sarif:
     name: Upload SARIF to Code Scanning
     needs: semgrep-scan
     if: ${{ needs.semgrep-scan.outputs.has_sarif == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-
-    # Least privilege: only the uploader can write security events
     permissions:
       contents: read
       security-events: write
-      actions: read                      # useful in private repos for status
+      actions: read
 
     steps:
-      # Harden egress in the uploader too
       - name: Harden runner (egress audit)
         uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
 
-      # Pull the SARIF produced by Job 1
       - name: Download SARIF artifact
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: semgrep-sarif
           path: .
 
-      # Upload to the Security tab. Category keeps tools distinct.
       - name: Upload SARIF to GitHub Security Dashboard
         uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
         with:
