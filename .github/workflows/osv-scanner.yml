@@ -141,6 +141,7 @@ jobs:
         run: |
           osv-scanner scan -r . \
             --allow-no-lockfiles \
+            --experimental-plugins lockfile,sbom,directory,artifact,govulncheck \
             --format sarif \
             --output "${SARIF_OUT}"
 
