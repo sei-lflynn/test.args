@@ -49,6 +49,11 @@ on:
       - "**/*.csproj"
       - "**/*.fsproj"
       - ".github/workflows/osv-scanner.yml"
+      # ── C/C++ dependency inputs ────────────────────────────────────────────────
+      - "**/conan.lock"                             # Conan lockfile is supported by OSV-Scanner.
+      - ".gitmodules"                               # Submodule definitions can add C/C++ deps.
+      - "**/third_party/**"                         # Vendored deps (common C/C++ practice).
+      - "**/vendor/**"                              # Vendored deps (alternative convention).
 
   # Merge queue batches (optional): catch issues in the combined set scheduled to merge.
   merge_group:
@@ -117,6 +122,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+          submodules: false                          # We’ll update submodules explicitly below.
+
+      # Ensure C/C++ submodule dependencies are present for commit-based matching.
+      - name: Initialize git submodules (for C/C++)
+        run: |
+          git submodule update --init --recursive
 
       # Install a pinned Go toolchain to install a pinned OSV-Scanner v2.
       - name: Setup Go (pinned)
@@ -132,7 +143,7 @@ jobs:
           osv-scanner --version
 
       # Run the scan:
-      #   • `scan -r .` recursively searches for supported lockfiles/SBOMs.
+      #   • `scan -r .` recursively searches for supported lockfiles/SBOMs and C/C++ deps.
       #   • `--allow-no-lockfiles` converts “no manifests found” into success (exit 0).
       #     Remove this once your repo always has manifests; or replace with explicit `-L` flags.
       #   • `continue-on-error: true` ensures we still publish SARIF if vulnerabilities are found.
