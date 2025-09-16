@@ -88,7 +88,7 @@ permissions:
 jobs:
   # ───────────────────────────────────────── Scan job (read-only) ─────────────────────────────────────────
   osv-scan:
-    name: OSV scan → SARIF
+    name: OSV scan → SARIF + JSON
     runs-on: ubuntu-24.04                              # Explicit OS for reproducibility.
     timeout-minutes: 20                                 # Bound execution time.
     permissions:
@@ -98,6 +98,7 @@ jobs:
     env:
       OSV_VERSION: v2.2.2                               # Pin OSV-Scanner major/minor on purpose.
       SARIF_OUT: osv.sarif                              # Write SARIF to repo root → no mkdir needed.
+      JSON_OUT: osv.json                                # Extra JSON file captures experimental findings.
 
     # Expose whether a SARIF exists so the upload job can decide to run.
     outputs:
@@ -147,15 +148,16 @@ jobs:
       #   • `--allow-no-lockfiles` converts “no manifests found” into success (exit 0).
       #     Remove this once your repo always has manifests; or replace with explicit `-L` flags.
       #   • `continue-on-error: true` ensures we still publish SARIF if vulnerabilities are found.
-      - name: Run OSV-Scanner → SARIF
+      #   • Dual output: SARIF (for GitHub UI) + JSON (for experimental_generic_findings).
+      - name: Run OSV-Scanner → SARIF + JSON
         continue-on-error: true
         run: |
           osv-scanner scan -r . \
             --allow-no-lockfiles \
             --call-analysis=all \
-            --experimental-plugins lockfile,sbom,directory,artifact,govulncheck \
-            --format sarif \
-            --output "${SARIF_OUT}"
+            --experimental-plugins lockfile,sbom,directory,artifact,govulncheck,weakcreds,cis \
+            --format sarif --output "${SARIF_OUT}" \
+            --format json  --output "${JSON_OUT}"
 
       # Record whether a SARIF file exists. The next step and the next job use this signal.
       - name: Check SARIF exists
@@ -175,6 +177,15 @@ jobs:
         with:
           name: osv-sarif
           path: ${{ env.SARIF_OUT }}
+          retention-days: 14
+
+      # Always upload JSON artifact (contains experimental_generic_findings).
+      - name: Upload JSON artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02      # v4.6.2
+        with:
+          name: osv-json
+          path: ${{ env.JSON_OUT }}
           retention-days: 14
 
   # ───────────────────────────────────── Upload job (least privilege) ─────────────────────────────────────
